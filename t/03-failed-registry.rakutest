@@ -1,0 +1,125 @@
+use Test;
+use lib 'lib';
+
+use JobQueue::Job;
+use JobQueue::FailedRegistry;
+
+plan 7;
+
+class TestJob does Job {
+    has Str $.kind = 'test';
+}
+
+sub job($scope = 1) { TestJob.new(scope-id => $scope) }
+
+subtest 'remember: inserts once, ignores duplicates, refuses nothing' => {
+    plan 6;
+    my $reg = JobQueue::FailedRegistry.new;
+    my $a = job();
+    ok $reg.remember($a), 'first remember returns True';
+    is $reg.elems, 1, 'registry holds it';
+    nok $reg.remember($a), 're-remembering the same id returns False';
+    is $reg.elems, 1, 'and does not duplicate it';
+    nok $reg.remember(Nil), 'an undefined job is a no-op returning False';
+    is $reg.elems, 1, 'registry unchanged by the no-op';
+};
+
+subtest 'cap: oldest entries are evicted, insertion order preserved' => {
+    plan 6;
+    my $reg = JobQueue::FailedRegistry.new(cap => 3);
+    my @jobs = (^3).map({ job() });
+    $reg.remember($_) for @jobs;
+    is $reg.elems, 3, 'filled to cap';
+    is-deeply $reg.ids, @jobs.map(*.id).List, 'ids are in insertion order';
+
+    my $fourth = job();
+    ok $reg.remember($fourth), 'a fourth job is accepted';
+    is $reg.elems, 3, 'still capped at three';
+    nok $reg.peek(@jobs[0].id).defined, 'the oldest job was evicted';
+    is-deeply $reg.ids,
+        (@jobs[1].id, @jobs[2].id, $fourth.id),
+        'order reflects the eviction';
+};
+
+subtest 'cap must be at least one' => {
+    plan 3;
+    dies-ok { JobQueue::FailedRegistry.new(cap => 0) }, 'a zero cap dies';
+    dies-ok { JobQueue::FailedRegistry.new(cap => -1) }, 'a negative cap dies';
+    lives-ok { JobQueue::FailedRegistry.new(cap => 1) }, 'a cap of one is fine';
+};
+
+subtest 'peek is non-destructive, claim is destructive' => {
+    plan 6;
+    my $reg = JobQueue::FailedRegistry.new;
+    my $a = job();
+    $reg.remember($a);
+
+    is $reg.peek($a.id).id, $a.id, 'peek returns the job';
+    is $reg.peek($a.id).id, $a.id, 'peek again — still there';
+    is $reg.elems, 1, 'peek did not remove it';
+    nok $reg.peek('no-such-id').defined, 'peek of an unknown id is Nil';
+
+    is $reg.claim($a.id).id, $a.id, 'claim returns the job';
+    is $reg.elems, 0, 'claim removed it';
+};
+
+subtest 'claim is atomic: concurrent claims produce exactly one winner' => {
+    plan 3;
+    my $reg = JobQueue::FailedRegistry.new;
+    my $a = job();
+    $reg.remember($a);
+
+    my atomicint $winners = 0;
+    await (^32).map: -> $i {
+        start {
+            atomic-fetch-inc($winners) if $reg.claim($a.id).defined;
+        }
+    }
+    is atomic-fetch($winners), 1, 'exactly one of 32 racing claims won';
+    is $reg.elems, 0, 'registry drained';
+    nok $reg.claim($a.id).defined, 'a later claim gets Nil';
+};
+
+subtest 'remember-cancelled: keeps user cancels, skips system supersedes' => {
+    plan 7;
+    my $reg = JobQueue::FailedRegistry.new;
+
+    my $cancelled = job();
+    $cancelled.request-cancel;
+    $cancelled.finish('cancelled', :by<cancel>);
+    ok $reg.remember-cancelled($cancelled), 'a cancelled job is remembered';
+    is $reg.peek($cancelled.id).id, $cancelled.id, 'and is retrievable';
+
+    my $superseded = job();
+    $superseded.finish('superseded', :by<cancel>);
+    nok $reg.remember-cancelled($superseded),
+        'a superseded job is skipped (its replacement is already scheduled)';
+    nok $reg.peek($superseded.id).defined, 'and never entered the registry';
+
+    # Fallback path: a job whose completion Promise never settled is
+    # judged on its display state instead.
+    my $unsettled = job();
+    $unsettled.state = 'superseded';
+    nok $reg.remember-cancelled($unsettled),
+        'an unsettled job with state superseded is skipped too';
+
+    nok $reg.remember-cancelled(Nil), 'an undefined job is a no-op';
+    is $reg.elems, 1, 'only the user cancel survives';
+};
+
+subtest 'a failed job round-trips its captured inputs to the retry' => {
+    # The whole point of the registry: the claimed job still carries
+    # the inputs a retry needs to build a bit-identical successor.
+    plan 4;
+    my $reg = JobQueue::FailedRegistry.new;
+    my $failed = TestJob.new(scope-id => 'doc-7');
+    $failed.error = 'backend fell over';
+    $failed.finish('error');
+    ok $reg.remember($failed), 'failure remembered';
+
+    my $claimed = $reg.claim($failed.id);
+    is $claimed.scope-id, 'doc-7', 'scope survives the round trip';
+    is $claimed.error, 'backend fell over', 'the failure reason survives';
+    nok $reg.claim($failed.id).defined,
+        'the second retry click finds nothing to claim';
+};

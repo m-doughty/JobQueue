@@ -1,0 +1,340 @@
+use Test;
+use lib 'lib';
+
+use JobQueue::Job;
+use JobQueue::Queue;
+use JobQueue::Coordinator;
+
+# The DAG coordinator: named-queue registry, dependency hold/release,
+# dep-result injection, cascade supersede, cross-queue edges, dedup
+# across held + queued jobs.
+
+plan 12;
+
+class TestJob does Job {
+    has Str $.kind = 'test';
+    has %.params;
+    has Int $.message-id is rw;
+
+    method dep-extras(--> Hash) {
+        $!message-id.defined ?? %( message-id => $!message-id ) !! %();
+    }
+}
+
+class ProbeStore {
+    has @.events;
+    method dispatch(Str:D $event, *%payload) {
+        @!events.push: %( :$event, |%payload );
+    }
+}
+
+sub wait-for(&cond, Num :$timeout = 5e0) {
+    my $t0 = now;
+    until &cond() || now - $t0 > $timeout {
+        await Promise.in(0.02);
+    }
+}
+
+# A queue whose runners wait on per-job gates.
+sub make-queue(Str $name, %gates, :$store) {
+    JobQueue::Queue.new(
+        :$name, :$store,
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { (await $g) // 'done' }
+        },
+    );
+}
+
+sub make-coord(%gates, :$store) {
+    my $coord = JobQueue::Coordinator.new(:$store);
+    $coord.register-queue('q-a', make-queue('q-a', %gates, :$store));
+    $coord.register-queue('q-b', make-queue('q-b', %gates, :$store));
+    $coord;
+}
+
+sub job($scope = 1, *%extra) {
+    TestJob.new(scope-id => $scope, |%extra);
+}
+
+subtest 'independent job dispatches immediately' => {
+    plan 2;
+    my %gates;
+    my $coord = make-coord(%gates);
+    my $j = $coord.submit('q-a', job());
+    wait-for(-> { %gates{$j.id}:exists });
+    ok %gates{$j.id}:exists, 'runner started without a tick';
+    %gates{$j.id}.keep('done');
+    await $j.completion;
+    is $j.state, 'done', 'completes normally';
+};
+
+subtest 'hard dependency holds, releases on done, injects dep-results' => {
+    plan 7;
+    my %gates;
+    my $probe = ProbeStore.new;
+    my $coord = make-coord(%gates, store => $probe);
+
+    my $dep = $coord.submit('q-a', job());
+    $dep.message-id = 512;
+    my $child = $coord.submit('q-a', job(1, depends-on => [$dep.id]));
+
+    wait-for(-> { %gates{$dep.id}:exists });
+    nok %gates{$child.id}:exists, 'dependent held while dep runs';
+    ok $probe.events.first({
+        $_<event> eq 'queue/job-waiting' && $_<job><id> eq $child.id
+    }), 'held job announced as waiting';
+
+    $dep.result = %( answer => 42 );
+    %gates{$dep.id}.keep('done');
+    await $dep.completion;
+    $coord.tick;
+    wait-for(-> { %gates{$child.id}:exists });
+    ok %gates{$child.id}:exists, 'dependent released after dep done';
+    is $child.dep-results{$dep.id}<state>, 'done', 'dep state injected';
+    is $child.dep-results{$dep.id}<result><answer>, 42, 'dep result injected';
+    is $child.dep-results{$dep.id}<message-id>, 512,
+        'dep-extras injected alongside state + result';
+
+    %gates{$child.id}.keep('done');
+    await $child.completion;
+    is $child.state, 'done', 'dependent completes';
+};
+
+subtest 'hard dependency failure supersedes the dependent' => {
+    plan 3;
+    my %gates;
+    my $probe = ProbeStore.new;
+    my $coord = make-coord(%gates, store => $probe);
+
+    my $dep = $coord.submit('q-a', job());
+    my $child = $coord.submit('q-a', job(1, depends-on => [$dep.id]));
+    wait-for(-> { %gates{$dep.id}:exists });
+
+    %gates{$dep.id}.keep('error');
+    await $dep.completion;
+    $coord.tick;
+    wait-for(-> { $child.completion.status ~~ Kept });
+
+    is $child.state, 'superseded', 'dependent superseded on dep failure';
+    nok %gates{$child.id}:exists, 'dependent never ran';
+    ok $probe.events.first({
+        $_<event> eq 'queue/job-superseded' && $_<job><id> eq $child.id
+    }), 'superseded event dispatched';
+};
+
+subtest 'soft (after) dependency runs regardless of outcome' => {
+    plan 3;
+    my %gates;
+    my $coord = make-coord(%gates);
+
+    my $dep = $coord.submit('q-a', job());
+    my $child = $coord.submit('q-a', job(1, after => [$dep.id]));
+    wait-for(-> { %gates{$dep.id}:exists });
+    nok %gates{$child.id}:exists, 'soft dependent waits for terminal';
+
+    %gates{$dep.id}.keep('error');
+    await $dep.completion;
+    $coord.tick;
+    wait-for(-> { %gates{$child.id}:exists });
+    ok %gates{$child.id}:exists, 'soft dependent runs after dep FAILURE';
+    is $child.dep-results{$dep.id}<state>, 'error',
+        'failure outcome visible in dep-results';
+
+    %gates{$child.id}.keep('done');
+    await $child.completion;
+};
+
+subtest 'cancel cascades over hard edges, spares soft edges' => {
+    plan 4;
+    my %gates;
+    my $coord = make-coord(%gates);
+
+    my $root = $coord.submit('q-a', job());
+    my $hard = $coord.submit('q-a', job(1, depends-on => [$root.id]));
+    my $grand = $coord.submit('q-b', job(1, depends-on => [$hard.id]));
+    my $soft = $coord.submit('q-a', job(1, after => [$root.id]));
+    wait-for(-> { %gates{$root.id}:exists });
+
+    $coord.cancel($root.id);
+    %gates{$root.id}.keep('cancelled');
+    await $root.completion;
+    $coord.tick;
+    wait-for(-> { $grand.completion.status ~~ Kept });
+
+    is $root.state, 'cancelled', 'root cancelled';
+    is $hard.state, 'superseded', 'hard dependent superseded';
+    is $grand.state, 'superseded', 'cascade crosses queues transitively';
+    # Soft dependent released to run once the root is terminal.
+    $coord.tick;
+    wait-for(-> { %gates{$soft.id}:exists });
+    %gates{$soft.id}.keep('done');
+    await $soft.completion;
+    is $soft.state, 'done', 'soft dependent survived the cascade';
+};
+
+subtest 'cross-queue hard edge: dep on q-a releases dependent on q-b' => {
+    plan 2;
+    my %gates;
+    my $coord = make-coord(%gates);
+    my $dep = $coord.submit('q-a', job());
+    my $child = $coord.submit('q-b', job(1, depends-on => [$dep.id]));
+    wait-for(-> { %gates{$dep.id}:exists });
+    %gates{$dep.id}.keep('done');
+    await $dep.completion;
+    $coord.tick;
+    wait-for(-> { %gates{$child.id}:exists });
+    ok %gates{$child.id}:exists, 'released across queues';
+    %gates{$child.id}.keep('done');
+    await $child.completion;
+    is $child.state, 'done', 'runs to completion on its own queue';
+};
+
+subtest 'dedup across held and queued jobs' => {
+    plan 3;
+    my %gates;
+    my $coord = make-coord(%gates);
+
+    my $dep = $coord.submit('q-a', job());
+    my $held = $coord.submit('q-a', job(1,
+        depends-on => [$dep.id], dedup-key => 'HK'));
+    my $dup-held = $coord.submit('q-a', job(1, dedup-key => 'HK'));
+    is $dup-held.id, $held.id, 'held job wins dedup';
+
+    my $queued = $coord.submit('q-a', job(1, dedup-key => 'QK'));
+    my $dup-queued = $coord.submit('q-a', job(1, dedup-key => 'QK'));
+    is $dup-queued.id, $queued.id, 'queued/running job wins dedup';
+
+    wait-for(-> { (%gates{$dep.id}:exists) && (%gates{$queued.id}:exists) });
+    %gates{$dep.id}.keep('done');
+    await $dep.completion;
+    $coord.tick;
+    wait-for(-> { %gates{$held.id}:exists });
+    %gates{$held.id}.keep('done');
+    %gates{$queued.id}.keep('done');
+    await Promise.allof($held.completion, $queued.completion);
+    ok True, 'both keyed jobs drained';
+};
+
+subtest 'unknown hard dependency fails fast as superseded' => {
+    plan 3;
+    my %gates;
+    my @logged;
+    my $log = class { has @.lines;
+        method debug(Str:D $v, *%f --> Nil) { }
+        method info(Str:D $v, *%f --> Nil) { }
+        method error(Str:D $v, *%f --> Nil) { @!lines.push: $v }
+    }.new;
+    my $coord = JobQueue::Coordinator.new(:$log);
+    $coord.register-queue('q-a', make-queue('q-a', %gates));
+    my $child = $coord.submit('q-a', job(1, depends-on => ['no-such-job']));
+    wait-for(-> { $child.completion.status ~~ Kept });
+    is $child.state, 'superseded', 'doomed immediately';
+    nok %gates{$child.id}:exists, 'never ran';
+    ok $log.lines.first(* eq 'coordinator/unknown-dependency'),
+        'the unknown dependency was logged as an error';
+};
+
+subtest 'unknown SOFT dependency is skipped, not doomed' => {
+    # Soft edges are best-effort: an "after" pointing at something
+    # that was never submitted is satisfied by definition, otherwise a
+    # probabilistic precursor that didn't fire would kill the work
+    # behind it.
+    plan 2;
+    my %gates;
+    my $coord = make-coord(%gates);
+    my $child = $coord.submit('q-a', job(1, after => ['no-such-job']));
+    wait-for(-> { %gates{$child.id}:exists });
+    ok %gates{$child.id}:exists, 'ran anyway';
+    %gates{$child.id}.keep('done');
+    await $child.completion;
+    is $child.state, 'done', 'completed normally';
+};
+
+subtest 'total-active counts live work only, never drainers' => {
+    # A reply lock keys on total-active: a cancelled job still
+    # draining its unabortable call occupies the backend but is
+    # nothing the user waits on — it must not keep the input locked.
+    plan 5;
+    my %gates;
+    my $coord = make-coord(%gates);
+    my $a = job(1);
+    $coord.submit('q-a', $a);
+    wait-for(-> { %gates{$a.id}:exists });
+    is $coord.total-active, 1, 'running job counts';
+
+    my $held = job(1, depends-on => [$a.id]);
+    $coord.submit('q-b', $held);
+    is $coord.total-active, 2, 'held dependent counts';
+
+    # Cancel the running job; its gate stays closed — a live drain.
+    $coord.cancel($a.id);
+    $coord.tick;
+    is $coord.total-active, 0,
+        'drainer and its superseded dependent are not live work';
+
+    # Drain ends: still zero, and nothing resurrects.
+    %gates{$a.id}.keep('done');
+    wait-for(-> { $coord.queue('q-a').running-count == 0 });
+    is $coord.total-active, 0, 'drain end leaves zero';
+    is $coord.queue('q-a').total-count, 0, 'queue fully empty';
+};
+
+subtest 'find-jobs filters by scope (eqv) and by an arbitrary predicate' => {
+    plan 6;
+    my %gates;
+    my $coord = make-coord(%gates);
+    # Str and Int scopes that stringify identically must not merge.
+    my $int-job = $coord.submit('q-a', job(7));
+    my $str-job = $coord.submit('q-a', job('7'));
+    my $tagged  = $coord.submit('q-b', job(7));
+    $tagged.message-id = 99;
+    wait-for(-> {
+        (%gates{$int-job.id}:exists) && (%gates{$str-job.id}:exists)
+        && (%gates{$tagged.id}:exists)
+    });
+
+    is $coord.find-jobs.elems, 3, 'no filter returns every live job';
+    is-deeply $coord.find-jobs(scope-id => '7').map(*.id).List,
+        ($str-job.id,), 'Str scope matches only the Str-scoped job';
+    is $coord.find-jobs(scope-id => 7).elems, 2,
+        'Int scope matches both Int-scoped jobs';
+    is-deeply $coord.find-jobs(
+            scope-id => 7,
+            where    => -> $j { ($j.message-id // 0) == 99 },
+        ).map(*.id).List,
+        ($tagged.id,), 'predicate narrows within a scope';
+    is $coord.find-jobs(where => -> $j { $j.scope-id eqv 'nope' }).elems, 0,
+        'a predicate that matches nothing returns an empty Seq';
+
+    .keep('done') for %gates.values;
+    await Promise.allof($int-job.completion, $str-job.completion,
+        $tagged.completion);
+    wait-for(-> { $coord.total-active == 0 });
+    is $coord.find-jobs.elems, 0, 'terminal jobs are not live';
+};
+
+subtest 'registry surface: duplicate names die, unknown names die, find-job falls through' => {
+    plan 6;
+    my %gates;
+    my $coord = make-coord(%gates);
+    dies-ok { $coord.register-queue('q-a', make-queue('dup', %gates)) },
+        'registering a duplicate queue name dies';
+    dies-ok { $coord.submit('q-nope', job()) },
+        'submitting to an unknown queue dies';
+    ok $coord.queue('q-a').defined, 'registered queue is retrievable';
+    nok $coord.queue('q-nope').defined, 'unknown queue name returns Nil';
+
+    # A job enqueued straight onto a queue is invisible to the
+    # coordinator's bookkeeping but must still be findable and
+    # cancellable — the fall-through scan over registered queues.
+    my $direct = job(3);
+    $coord.queue('q-a').enqueue($direct);
+    wait-for(-> { %gates{$direct.id}:exists });
+    is $coord.find-job($direct.id).id, $direct.id,
+        'find-job falls through to the queues';
+    ok $coord.cancel($direct.id), 'cancel falls through to the queues';
+    %gates{$direct.id}.keep('done');
+    await $direct.completion;
+};

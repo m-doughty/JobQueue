@@ -1,0 +1,25 @@
+Revision history for JobQueue
+
+{{$NEXT}}
+
+0.1.0  2026-08-10T19:52:26+01:00
+    - Initial release
+    - JobQueue::Job role: atomic terminal transitions (finish /
+      request-cancel / begin-running), cancel + completion Promises,
+      dedup keys, lanes, priorities, hard/soft dependency edges, and
+      the keep-once atomic Promise settler
+    - JobQueue::Queue: per-resource serial/parallel queue with
+      re-evaluated parallelism policy, max-concurrent cap, lane
+      serialisation, priority dispatch, live-job dedup, deferred
+      cancel terminals and an optional store event sink
+    - JobQueue::Coordinator: named-queue registry plus a cross-queue
+      dependency DAG with hold/release, dep-result injection and
+      transitive supersede cascades over hard edges
+    - JobQueue::FailedRegistry: capped, insertion-ordered registry of
+      failed/cancelled jobs with atomic claim-for-retry
+    - Injectable log + tracer (null objects by default) and an
+      EventSink documentation role
+    - JobQueue::Job's role and keep-once sub are package-scoped as
+      well as exported, so a host application can wrap the role in
+      its own facade module (need + fully-qualified name) and
+      re-export both without a name clash

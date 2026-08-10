@@ -1,0 +1,334 @@
+use Test;
+use lib 'lib';
+
+use JobQueue::Job;
+use JobQueue::Queue;
+use JobQueue::Coordinator;
+use JobQueue::EventSink;
+use JobQueue::Observability;
+
+# Everything the queue talks to that isn't a job: the log, the tracer
+# and the store sink. All three are injected, all three have a
+# documented shape, and the first two default to silent null objects.
+
+plan 8;
+
+sub wait-for(&cond, Num :$timeout = 5e0) {
+    my $t0 = now;
+    until &cond() || now - $t0 > $timeout {
+        await Promise.in(0.02);
+    }
+}
+
+class TestJob does Job {
+    has Str $.kind = 'test';
+}
+
+# A job that tries to overwrite queue-owned snapshot keys and to
+# rewrite its dependents' state/result. Both attempts must lose.
+class GreedyJob does Job {
+    has Str $.kind = 'greedy';
+    has Int $.message-id is rw = 7;
+
+    method snapshot-extras(--> Hash) {
+        %(
+            message-id => $!message-id,
+            preview    => 'hello',
+            # All reserved — must not land.
+            id          => 'FORGED',
+            state       => 'FORGED',
+            error       => 'FORGED',
+            scope-id    => 'FORGED',
+            cancellable => 'FORGED',
+            priority    => 'FORGED',
+        );
+    }
+
+    method dep-extras(--> Hash) {
+        %(
+            message-id => $!message-id,
+            state      => 'FORGED',
+            result     => 'FORGED',
+        );
+    }
+}
+
+class ProbeLog {
+    has @.calls;
+    method debug(Str:D $verb, *%fields --> Nil) {
+        @!calls.push: %( level => 'debug', :$verb, fields => %fields );
+    }
+    method info(Str:D $verb, *%fields --> Nil) {
+        @!calls.push: %( level => 'info', :$verb, fields => %fields );
+    }
+    method error(Str:D $verb, *%fields --> Nil) {
+        @!calls.push: %( level => 'error', :$verb, fields => %fields );
+    }
+    method verbs() { @!calls.map(*<verb>).List }
+}
+
+class ProbeSpan {
+    has Str $.name is required;
+    has     $.sink is required;      # shared Array of finish records
+    method finish(*%args --> Nil) {
+        $!sink.push: %( name => $!name, args => %args );
+    }
+}
+
+class ProbeTracer {
+    has Bool $.on = True;
+    has @.started;
+    has @.finished;
+    has @.instants;
+    method enabled(--> Bool) { $!on }
+    method start(Str:D $name, *%opts) {
+        @!started.push: $name;
+        ProbeSpan.new(:$name, sink => @!finished);
+    }
+    method instant(Str:D $name, *%opts --> Nil) { @!instants.push: $name }
+}
+
+class ProbeStore {
+    has @.events;
+    method dispatch(Str:D $event, *%payload) {
+        @!events.push: %( :$event, |%payload );
+    }
+}
+
+# %gates is passed in (not returned) so the runner closure and the
+# test share one hash — a returned Hash would be copied on assignment
+# and the test would never see the gates the runner registers.
+sub gated-queue(%gates, *%extra) {
+    JobQueue::Queue.new(
+        name            => 'inject',
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { (await $g) // 'done' }
+        },
+        |%extra,
+    );
+}
+
+subtest 'the defaults are the null objects, and they are silent' => {
+    plan 6;
+    my %gates;
+    my $q = gated-queue(%gates);
+    isa-ok $q.log, NullLog, 'log defaults to NullLog';
+    isa-ok $q.tracer, NullTracer, 'tracer defaults to NullTracer';
+    nok $q.tracer.enabled, 'a null tracer is never enabled';
+
+    # A full lifecycle through the null objects: enqueue, start,
+    # phase, finish. Nothing may throw, nothing may be recorded.
+    my $job = $q.enqueue(TestJob.new(scope-id => 1));
+    wait-for(-> { %gates{$job.id}:exists });
+    lives-ok { $q.note-phase($job, 'working') }, 'note-phase survives the null sinks';
+    %gates{$job.id}.keep('done');
+    await $job.completion;
+    wait-for(-> { $q.total-count == 0 });
+    is $job.state, 'done', 'the job ran to completion regardless';
+
+    # And the null objects themselves answer every documented call.
+    lives-ok {
+        my $l = NullLog.new;
+        $l.debug('v', :a(1)); $l.info('v', :a(1)); $l.error('v', :a(1));
+        my $t = NullTracer.new;
+        $t.instant('v', cat => 'x', args => %( a => 1 ));
+        $t.start('v', cat => 'x', args => %( a => 1 ), slow-ms => 5e0).finish(b => 2);
+    }, 'null log + tracer answer the whole contract';
+};
+
+subtest 'the happy path drives the documented log + tracer calls' => {
+    plan 8;
+    my $log = ProbeLog.new;
+    my $tracer = ProbeTracer.new;
+    my %gates;
+    my $q = gated-queue(%gates, :$log, :$tracer);
+
+    my $job = $q.enqueue(TestJob.new(scope-id => 1));
+    wait-for(-> { %gates{$job.id}:exists });
+
+    ok $tracer.started.grep(* eq 'queue.enqueue'), 'enqueue opened a span';
+    ok $tracer.started.grep(* eq 'queue.tick'), 'tick opened a span';
+    ok $tracer.started.grep(* eq 'queue.job-run'), 'the runner opened a span';
+    ok $tracer.instants.grep(* eq 'queue.job-started'),
+        'job start is an instant marker';
+    ok $log.verbs.grep(* eq 'inject/job-started'), 'job start was logged';
+
+    %gates{$job.id}.keep('done');
+    await $job.completion;
+    wait-for(-> { $log.verbs.grep(* eq 'inject/job-finished').elems > 0 });
+
+    ok $log.verbs.grep(* eq 'inject/job-finished'), 'job finish was logged';
+    my $finish = $log.calls.first({ $_<verb> eq 'inject/job-finished' });
+    is $finish<fields><outcome>, 'done', 'the finish log carries the outcome';
+    my $run = $tracer.finished.first({ $_<name> eq 'queue.job-run' });
+    is $run<args><outcome>, 'done', 'the run span finished with the outcome';
+};
+
+subtest 'the cancel and dedup paths drive their own calls' => {
+    plan 7;
+    my $log = ProbeLog.new;
+    my $tracer = ProbeTracer.new;
+    my %gates;
+    my $q = gated-queue(%gates, :$log, :$tracer);
+
+    # Dedup: the dropped job is logged at debug and its span closes
+    # with deduped => True.
+    my $a = $q.enqueue(TestJob.new(scope-id => 1, dedup-key => 'DK'));
+    my $b = $q.enqueue(TestJob.new(scope-id => 1, dedup-key => 'DK'));
+    is $b.id, $a.id, 'dedup returned the live job';
+    my $dedup-log = $log.calls.first({ $_<verb> eq 'inject/job-deduped' });
+    ok $dedup-log.defined, 'the dedup hit was logged at debug';
+    is $dedup-log<level>, 'debug', 'and at debug level specifically';
+    ok $tracer.finished.first({
+        $_<name> eq 'queue.enqueue' && $_<args><deduped>
+    }), 'the enqueue span closed as deduped';
+
+    # Cancel: its own span, and an info line naming the outcome and
+    # whether the job was pending or running.
+    wait-for(-> { %gates{$a.id}:exists });
+    ok $q.cancel($a.id), 'cancel won the transition';
+    ok $tracer.started.grep(* eq 'queue.cancel'), 'cancel opened a span';
+    ok $log.verbs.grep(* eq 'inject/job-cancelled-running'),
+        'cancel logged the outcome and the job position';
+
+    %gates{$a.id}.keep('done');
+    await $a.completion;
+};
+
+subtest 'a disabled tracer is never asked to start a span' => {
+    plan 3;
+    my $tracer = ProbeTracer.new(on => False);
+    my %gates;
+    my $q = gated-queue(%gates, :$tracer);
+    my $job = $q.enqueue(TestJob.new(scope-id => 1));
+    wait-for(-> { %gates{$job.id}:exists });
+    %gates{$job.id}.keep('done');
+    await $job.completion;
+    wait-for(-> { $q.total-count == 0 });
+
+    is $tracer.started.elems, 0, 'no spans were opened';
+    is $tracer.finished.elems, 0, 'and none were finished';
+    # instant() is deliberately NOT gated on enabled — a tracer that
+    # cares checks for itself, exactly as NullTracer does.
+    ok $tracer.instants.grep(* eq 'queue.job-started'),
+        'instant markers still reach the tracer';
+};
+
+subtest 'snapshot-extras merges, but queue-owned keys always win' => {
+    plan 8;
+    my $probe = ProbeStore.new;
+    my %gates;
+    my $q = gated-queue(%gates, store => $probe);
+    my $job = GreedyJob.new(scope-id => 'doc-1');
+    $q.enqueue($job);
+    wait-for(-> { %gates{$job.id}:exists });
+
+    my %snap = $q.job-snapshot($job);
+    is %snap<message-id>, 7, 'a non-reserved extra lands';
+    is %snap<preview>, 'hello', 'and so does another';
+    is %snap<id>, $job.id, 'id was not forged';
+    is %snap<state>, 'running', 'state was not forged';
+    is %snap<scope-id>, 'doc-1', 'scope-id was not forged';
+    is %snap<cancellable>, True, 'cancellable was not forged';
+    is %snap<priority>, 0, 'priority was not forged';
+    # error is absent (empty) on this job — an extra must not be able
+    # to conjure a failure reason for a job that has none.
+    nok %snap<error>:exists, 'a reserved key that is ABSENT stays absent';
+
+    %gates{$job.id}.keep('done');
+    await $job.completion;
+};
+
+subtest 'dep-extras reach dependents, but state + result always win' => {
+    plan 4;
+    my %gates;
+    my $coord = JobQueue::Coordinator.new;
+    $coord.register-queue('q', JobQueue::Queue.new(
+        name            => 'q',
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { (await $g) // 'done' }
+        },
+    ));
+
+    my $dep = $coord.submit('q', GreedyJob.new(scope-id => 1));
+    my $child = $coord.submit('q',
+        TestJob.new(scope-id => 1, depends-on => [$dep.id]));
+    wait-for(-> { %gates{$dep.id}:exists });
+
+    $dep.result = %( payload => 'real' );
+    %gates{$dep.id}.keep('done');
+    await $dep.completion;
+    $coord.tick;
+    wait-for(-> { %gates{$child.id}:exists });
+
+    my %r = $child.dep-results{$dep.id};
+    is %r<message-id>, 7, 'a non-reserved dep-extra lands';
+    is %r<state>, 'done', 'state came from the dependency, not the extras';
+    is %r<result><payload>, 'real',
+        'result came from the dependency, not the extras';
+    is %r.keys.sort.List, <message-id result state>,
+        'no other keys crept in';
+
+    %gates{$child.id}.keep('done');
+    await $child.completion;
+};
+
+subtest 'EventSink composes, and its stub refuses to be called' => {
+    plan 4;
+    my class LedgerSink does JobQueue::EventSink {
+        has @.rows;
+        method dispatch(Str:D $event, *%payload) {
+            @!rows.push: %( :$event, queue => %payload<queue>,
+                            id => %payload<job><id> );
+        }
+    }
+    my $sink = LedgerSink.new;
+    ok $sink ~~ JobQueue::EventSink, 'the sink composes the role';
+
+    my %gates;
+    my $q = gated-queue(%gates, store => $sink);
+    my $job = $q.enqueue(TestJob.new(scope-id => 1));
+    wait-for(-> { %gates{$job.id}:exists });
+    %gates{$job.id}.keep('done');
+    await $job.completion;
+    wait-for(-> { $sink.rows.grep({ $_<event> eq 'queue/job-finished' }) });
+
+    is $sink.rows[0]<event>, 'queue/job-enqueued',
+        'the role-composing sink received the lifecycle';
+    is $sink.rows[0]<queue>, 'inject', 'with the queue name';
+    throws-like { JobQueue::EventSink.new.dispatch('x') }, Exception,
+        message => /'must be implemented'/,
+        'the bare role stub refuses to pretend it works';
+};
+
+subtest 'the coordinator takes the same log injection' => {
+    plan 4;
+    my $log = ProbeLog.new;
+    my %gates;
+    my $coord = JobQueue::Coordinator.new(:$log);
+    isa-ok JobQueue::Coordinator.new.log, NullLog,
+        'coordinator log defaults to NullLog';
+    $coord.register-queue('q', JobQueue::Queue.new(
+        name            => 'q',
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { (await $g) // 'done' }
+        },
+    ));
+
+    # Unknown hard dep: error log + a held-supersede info line.
+    my $doomed = $coord.submit('q',
+        TestJob.new(scope-id => 1, depends-on => ['nope']));
+    wait-for(-> { $doomed.completion.status ~~ Kept });
+    my $err = $log.calls.first({ $_<verb> eq 'coordinator/unknown-dependency' });
+    ok $err.defined, 'the unknown dependency was logged';
+    is $err<level>, 'error', 'at error level';
+    ok $log.calls.first({
+        $_<verb> eq 'coordinator/job-superseded-held' && $_<level> eq 'info'
+    }), 'the held supersede was logged at info';
+};

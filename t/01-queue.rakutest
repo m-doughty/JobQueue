@@ -1,0 +1,846 @@
+use Test;
+use lib 'lib';
+
+use JobQueue::Job;
+use JobQueue::Queue;
+
+plan 23;
+
+my constant @TERMINAL-EVENTS = <
+    queue/job-finished queue/job-failed
+    queue/job-cancelled queue/job-superseded
+>;
+
+# The queue is generic over Job-composing classes; this is the
+# fixture that stands in for a real one. `params` and `message-id`
+# exist so the snapshot-extras / dep-extras override points have
+# something to advertise.
+class TestJob does Job {
+    has Str $.kind = 'test';
+    has %.params;
+    has Int $.message-id is rw;
+
+    method snapshot-extras(--> Hash) {
+        my %e;
+        %e<message-id> = $!message-id if $!message-id.defined;
+        %e<preview> = %!params<text>.Str.substr(0, 160)
+            if (%!params<text> // '').Str.chars;
+        %e;
+    }
+}
+
+# A class that ships a non-zero priority the way a pipeline-critical
+# sub-job does: short work that must never sit behind bulk jobs.
+class PriorityJob does Job {
+    has Str $.kind = 'priority';
+    submethod TWEAK() { $!priority = 10 }
+}
+
+# Tests are gated on Promises rather than wall-clock sleeps so a
+# misbehaving runner can't hang the suite. Each runner waits on a
+# job-keyed Promise that the test trips explicitly when it wants
+# the job to complete.
+sub make-job($scope, *%extra) {
+    TestJob.new(scope-id => $scope, |%extra);
+}
+
+# Minimal store double: records every dispatch so tests can assert
+# which queue/* events fired and with what payload.
+class ProbeStore {
+    has @.events;
+    method dispatch(Str:D $event, *%payload) {
+        @!events.push: %( :$event, |%payload );
+    }
+}
+
+# Poll until &cond is true (or timeout) — the queue's terminal
+# dispatch runs in a .then on the threadpool, after job.completion.
+sub wait-for(&cond, Num :$timeout = 5e0) {
+    my $t0 = now;
+    until &cond() || now - $t0 > $timeout {
+        await Promise.in(0.02);
+    }
+}
+
+subtest 'serial mode: only one job runs at a time' => {
+    plan 4;
+    my @order;
+    my %gates;     # job-id → Promise; runner waits on it
+    my $q = JobQueue::Queue.new(
+        name            => 'test-serial',
+        is-parallel-now => -> { False },
+        run-job         => -> $job {
+            @order.push: 'start-' ~ $job.id.substr(0, 4);
+            my $g = Promise.new;
+            %gates{$job.id} = $g;
+            start {
+                await $g;
+                @order.push: 'end-' ~ $job.id.substr(0, 4);
+                'done';
+            }
+        },
+    );
+
+    my @jobs;
+    @jobs.push: $q.enqueue(make-job(1)) for ^3;
+
+    # Give the runner a moment to start the head job.
+    await Promise.in(0.05);
+
+    is $q.running-count, 1, 'one job running';
+    is $q.pending-count, 2, 'two pending';
+
+    # Drain serially. await-ing each completion before keeping the
+    # next gate ensures strict end-then-start ordering.
+    for @jobs -> $j {
+        # The next-pending job's gate doesn't exist until the queue
+        # dispatches it (which only happens after the prior end).
+        # So loop until it appears.
+        until %gates{$j.id}:exists { await Promise.in(0.01) }
+        %gates{$j.id}.keep;
+        await $j.completion;
+    }
+
+    is @order.elems, 6, 'each job had start + end';
+    is-deeply
+        @order.map(*.starts-with('end-')).List,
+        (False, True, False, True, False, True).List,
+        'strict serialisation: end-N before start-N+1';
+};
+
+subtest 'parallel mode: all jobs run concurrently' => {
+    plan 2;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-parallel',
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            my $g = Promise.new;
+            %gates{$job.id} = $g;
+            start { await $g; 'done' }
+        },
+    );
+    my @jobs;
+    @jobs.push: $q.enqueue(make-job(1)) for ^3;
+    await Promise.in(0.05);
+
+    is $q.running-count, 3, 'all three running concurrently';
+    is $q.pending-count, 0, 'nothing pending';
+    %gates{.id}.keep for @jobs;
+    await Promise.allof(|@jobs.map(*.completion));
+};
+
+subtest 'cancel pending: removed from queue, marked cancelled' => {
+    plan 4;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-cancel-pending',
+        is-parallel-now => -> { False },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    my $a = $q.enqueue(make-job(1));
+    my $b = $q.enqueue(make-job(1));
+    await Promise.in(0.05);
+
+    is $q.pending-count, 1, 'one pending (b)';
+    my $ok = $q.cancel($b.id);
+    ok $ok, 'cancel returned True';
+    is $q.pending-count, 0, 'pending list drained';
+    is $b.state, 'cancelled', 'job state flipped';
+
+    %gates{$a.id}.keep;
+    await $a.completion;
+};
+
+subtest 'cancel running: keeps token, fires on-cancel callback' => {
+    plan 4;
+    my %gates;
+    my $cancel-fired = 0;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-cancel-running',
+        is-parallel-now => -> { False },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'cancelled' }
+        },
+    );
+    my $a = $q.enqueue(make-job(1));
+    await Promise.in(0.05);
+    is $q.running-count, 1, 'running';
+
+    my $ok = $q.cancel($a.id, on-cancel => -> $running {
+        $cancel-fired++;
+        # Simulate a well-behaved runner observing the cancel-token
+        # by tripping its gate.
+        %gates{$running.id}.keep
+            unless %gates{$running.id}.status ~~ Kept;
+    });
+    ok $ok, 'cancel found the running job';
+    is $cancel-fired, 1, 'on-cancel fired exactly once';
+    await $a.completion;
+    ok $a.cancel-token.status ~~ Kept, 'cancel-token kept';
+};
+
+subtest 'cancel non-existent job returns False' => {
+    plan 1;
+    my $q = JobQueue::Queue.new(
+        name => 'test-no-job',
+        is-parallel-now => -> { False },
+        run-job         => -> $job { start { 'done' } },
+    );
+    nok $q.cancel('does-not-exist'), 'returns False';
+};
+
+subtest 'cancel-most-recent-in-scope: running preferred over pending; wrong scope untouched' => {
+    plan 4;
+    my %gates;
+    my $cancelled-id;
+    my $q = JobQueue::Queue.new(
+        name => 'test-most-recent',
+        is-parallel-now => -> { False },
+        run-job => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    my $running = $q.enqueue(make-job(7));    # starts immediately
+    my $pending = $q.enqueue(make-job(7));    # waits behind running
+    my $other   = $q.enqueue(make-job(99));   # different scope
+    # Gate on the runner having actually STARTED $running (its gate
+    # exists), not on wall-clock — under full-suite load 50ms wasn't
+    # always enough, and cancel-most-recent-in-scope would pick the
+    # pending job instead of the running one.
+    until %gates{$running.id}:exists { await Promise.in(0.01) }
+
+    my $ok = $q.cancel-most-recent-in-scope(7, on-cancel => -> $j {
+        $cancelled-id = $j.id;
+        %gates{$j.id}.keep unless %gates{$j.id}.status ~~ Kept;
+    });
+    ok $ok, 'found a job';
+    is $cancelled-id, $running.id,
+        'cancelled the running job, not pending or other-scope';
+    # Pending may already have been dispatched by the queue's
+    # post-cancel tick (the running slot freed). What we care about
+    # is that cancel didn't mark it cancelled.
+    isnt $pending.state, 'cancelled', 'pending job not cancelled';
+    await $running.completion;
+
+    # Pending now runs. Gate on its runner start (not wall-clock) so
+    # the cancel below always finds an existing gate to keep.
+    until %gates{$pending.id}:exists { await Promise.in(0.01) }
+    $q.cancel($pending.id, on-cancel => -> $j {
+        %gates{$j.id}.keep unless %gates{$j.id}.status ~~ Kept;
+    });
+    $q.cancel($other.id, on-cancel => -> $j {
+        # other-scope is pending until pending finishes; might be
+        # running or pending here. Cancel covers both.
+        %gates{$j.id}.keep
+            if %gates{$j.id}.defined
+               && %gates{$j.id}.status !~~ Kept;
+    });
+    is $other.state, 'cancelled', 'other-scope cleanup completed';
+};
+
+subtest 'scope ids are compared with eqv: Int 7 and Str "7" never collide' => {
+    # scope-id is deliberately untyped so callers can key on
+    # conversation ids, slugs or uuids. Everything that filters on it
+    # uses eqv, so a numeric scope and its stringification stay
+    # distinct rather than silently merging.
+    plan 6;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name => 'test-scope-eqv',
+        is-parallel-now => -> { True },
+        run-job => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    my $int-job = $q.enqueue(make-job(7));
+    my $str-job = $q.enqueue(make-job('7'));
+    wait-for(-> { (%gates{$int-job.id}:exists) && (%gates{$str-job.id}:exists) });
+
+    is-deeply $q.jobs-for-scope(7).map(*.id).List, ($int-job.id,),
+        'jobs-for-scope(7) sees only the Int-scoped job';
+    is-deeply $q.jobs-for-scope('7').map(*.id).List, ($str-job.id,),
+        'jobs-for-scope("7") sees only the Str-scoped job';
+    is $q.jobs-for-scope('nope').elems, 0, 'unknown scope matches nothing';
+
+    ok $q.cancel-most-recent-in-scope('7'), 'Str scope cancel found its job';
+    is $str-job.state, 'cancelled', 'and cancelled the Str-scoped job';
+    isnt $int-job.state, 'cancelled', 'the Int-scoped job was untouched';
+
+    %gates{$int-job.id}.keep;
+    %gates{$str-job.id}.keep;
+    await Promise.allof($int-job.completion, $str-job.completion);
+};
+
+subtest 'parallelism flip drains pending on next tick' => {
+    plan 2;
+    my $serial = True;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name => 'test-flip',
+        is-parallel-now => -> { !$serial },
+        run-job => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    my $a = $q.enqueue(make-job(1));   # serial → runs immediately
+    my $b = $q.enqueue(make-job(1));   # serial → pending
+    await Promise.in(0.05);
+
+    is $q.running-count, 1, 'one running while serial';
+
+    $serial = False;
+    $q.tick;
+    await Promise.in(0.05);
+    is $q.running-count, 2, 'both running after flip + tick';
+
+    .keep for %gates.values;
+    await Promise.allof($a.completion, $b.completion);
+};
+
+subtest 'failure outcomes dispatch queue/job-failed, not job-finished' => {
+    plan 10;
+    my $probe = ProbeStore.new;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-failed',
+        store           => $probe,
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start {
+                await $g;
+                given $job.params<outcome> // 'done' {
+                    when 'broken' {
+                        # Well-behaved runner: annotate then finish.
+                        $job.error = 'backend fell over';
+                        $job.finish('broken');
+                        'broken';
+                    }
+                    when 'die' { die 'kaboom' }
+                    default    { 'done' }
+                }
+            }
+        },
+    );
+
+    sub run-one(Str $outcome) {
+        my $job = TestJob.new(
+            scope-id => 1,
+            params   => { :$outcome },
+        );
+        $q.enqueue($job);
+        wait-for(-> { %gates{$job.id}:exists });
+        %gates{$job.id}.keep;
+        await $job.completion;
+        wait-for(-> {
+            $probe.events.first({
+                $_<job><id> eq $job.id
+                && $_<event> ∈ <queue/job-finished queue/job-failed>
+            }).defined
+        });
+        $job;
+    }
+
+    my $ok-job = run-one('done');
+    my @ok-terminal = $probe.events.grep({ $_<job><id> eq $ok-job.id });
+    ok @ok-terminal.first({ $_<event> eq 'queue/job-finished' }),
+        'done job dispatches job-finished';
+    nok @ok-terminal.first({ $_<event> eq 'queue/job-failed' }),
+        'done job dispatches no job-failed';
+
+    my $broken-job = run-one('broken');
+    my @broken = $probe.events.grep({
+        $_<job><id> eq $broken-job.id
+        && $_<event> ∈ <queue/job-finished queue/job-failed>
+    });
+    is @broken.elems, 1, 'broken job dispatches exactly one terminal event';
+    is @broken[0]<event>, 'queue/job-failed', 'and it is job-failed';
+    is @broken[0]<job><state>, 'broken', 'snapshot carries the runner state';
+    is @broken[0]<job><error>, 'backend fell over',
+        'snapshot carries the runner-set error';
+
+    my $died-job = run-one('die');
+    my @died = $probe.events.grep({
+        $_<job><id> eq $died-job.id
+        && $_<event> ∈ <queue/job-finished queue/job-failed>
+    });
+    is @died.elems, 1, 'thrown runner dispatches exactly one terminal event';
+    is @died[0]<event>, 'queue/job-failed', 'and it is job-failed';
+    is $died-job.state, 'error', 'job finished as error';
+    is @died[0]<job><error>, 'kaboom',
+        'error captured from the broken promise exception';
+};
+
+subtest 'dedup-key: live job wins, terminal job re-enqueues' => {
+    plan 4;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-dedup',
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    sub keyed-job() { make-job(1, dedup-key => 'K1') }
+    my $a = $q.enqueue(keyed-job);
+    my $b = $q.enqueue(keyed-job);
+    is $b.id, $a.id, 'duplicate key returns the existing live job';
+    is $q.total-count, 1, 'nothing extra enqueued';
+
+    wait-for(-> { %gates{$a.id}:exists });
+    %gates{$a.id}.keep;
+    await $a.completion;
+    wait-for(-> { $q.total-count == 0 });
+
+    my $c = $q.enqueue(keyed-job);
+    isnt $c.id, $a.id, 'after terminal, the same key enqueues fresh';
+    %gates{$c.id}.keep if %gates{$c.id}.defined;
+    await $c.completion;
+    ok True, 'fresh keyed job completes';
+};
+
+subtest 'lanes: serial per lane, FIFO within, cross-lane overtake' => {
+    plan 5;
+    my %gates;
+    my @started;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-lanes',
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            @started.push: $job.id;
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    sub lane-job(Str $lane) { make-job(1, :$lane) }
+    my $a1 = $q.enqueue(lane-job('A'));
+    my $a2 = $q.enqueue(lane-job('A'));
+    my $b1 = $q.enqueue(lane-job('B'));
+    wait-for(-> { @started.elems >= 2 });
+
+    is @started.grep(* eq $a1.id).elems, 1, 'lane A head started';
+    is @started.grep(* eq $b1.id).elems, 1, 'lane B overtakes the blocked A2';
+    is @started.grep(* eq $a2.id).elems, 0, 'A2 waits for A1';
+
+    %gates{$a1.id}.keep;
+    await $a1.completion;
+    wait-for(-> { @started.grep(* eq $a2.id).elems == 1 });
+    is @started.grep(* eq $a2.id).elems, 1, 'A2 dispatches once A1 finishes';
+    is @started.first(* eq $a1.id, :k) < @started.first(* eq $a2.id, :k), True,
+        'FIFO preserved within the lane';
+
+    %gates{$a2.id}.keep if %gates{$a2.id}.defined;
+    %gates{$b1.id}.keep if %gates{$b1.id}.defined;
+    await Promise.allof($a2.completion, $b1.completion);
+};
+
+subtest 'lane released by a cancelled-but-draining job' => {
+    plan 2;
+    my %gates;
+    my @started;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-lane-drain',
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            @started.push: $job.id;
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    my $a = $q.enqueue(make-job(1, lane => 'L'));
+    wait-for(-> { @started.elems == 1 });
+    my $b = $q.enqueue(make-job(1, lane => 'L'));
+
+    # Cancel A but do NOT release its gate — it drains. The lane must
+    # free immediately so B dispatches.
+    $q.cancel($a.id);
+    $q.tick;
+    wait-for(-> { @started.elems == 2 });
+    is @started.elems, 2, 'successor dispatched while predecessor drains';
+    is @started[1], $b.id, 'and it is the lane successor';
+
+    %gates{$a.id}.keep;
+    %gates{$b.id}.keep;
+    await $b.completion;
+};
+
+subtest 'max-concurrent caps parallel dispatch' => {
+    plan 3;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-cap',
+        is-parallel-now => -> { True },
+        max-concurrent  => 2,
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    my @jobs = (^4).map({ $q.enqueue(make-job(1)) });
+    # Poll rather than sleeping a fixed 100 ms: the runners start on
+    # the threadpool, and under a loaded parallel test run they can
+    # take longer than that to be scheduled — which failed this
+    # subtest for reasons that had nothing to do with the cap.
+    wait-for(-> { $q.running-count == 2 });
+    is $q.running-count, 2, 'cap respected';
+    is $q.pending-count, 2, 'excess waits';
+
+    %gates{@jobs[0].id}.keep;
+    await @jobs[0].completion;
+    wait-for(-> { $q.running-count == 2 });
+    is $q.running-count, 2, 'freed slot refills';
+    for @jobs[1..3] -> $j {
+        wait-for(-> { %gates{$j.id}:exists });
+        %gates{$j.id}.keep;
+        await $j.completion;
+    }
+};
+
+subtest 'note-phase / note-progress dispatch and guard' => {
+    plan 6;
+    my $probe = ProbeStore.new;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-phase',
+        store           => $probe,
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    my $job = $q.enqueue(make-job(1));
+    wait-for(-> { %gates{$job.id}:exists });
+
+    $q.note-phase($job, 'sampling');
+    my $phase-ev = $probe.events.first({ $_<event> eq 'queue/job-phase-changed' });
+    ok $phase-ev.defined, 'phase event dispatched';
+    is $phase-ev<job><phase>, 'sampling', 'snapshot carries the phase';
+    is $job.phase, 'sampling', 'job records the phase';
+
+    $q.note-progress($job, value => 5, max => 20, node => 'KSampler');
+    my $prog-ev = $probe.events.first({ $_<event> eq 'queue/job-progressed' });
+    ok $prog-ev.defined, 'progress event dispatched';
+    is $prog-ev<job><progress><value>, 5, 'progress payload carried';
+
+    %gates{$job.id}.keep;
+    await $job.completion;
+    wait-for(-> {
+        $probe.events.first({ $_<event> eq 'queue/job-finished' }).defined
+    });
+    my $n = $probe.events.elems;
+    $q.note-phase($job, 'ghost');
+    is $probe.events.elems, $n, 'post-terminal note-phase is dropped';
+};
+
+subtest 'cancel outcome superseded emits queue/job-superseded' => {
+    plan 3;
+    my $probe = ProbeStore.new;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-supersede',
+        store           => $probe,
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    my $job = $q.enqueue(make-job(1));
+    wait-for(-> { %gates{$job.id}:exists });
+    ok $q.cancel($job.id, outcome => 'superseded'), 'supersede takes effect';
+    is $job.state, 'superseded', 'job state is superseded';
+    %gates{$job.id}.keep;
+    await $job.completion;
+    wait-for(-> {
+        $probe.events.first({ $_<event> eq 'queue/job-superseded' }).defined
+    });
+    my @terminals = $probe.events.grep({
+        $_<event> ∈ @TERMINAL-EVENTS && $_<job><id> eq $job.id
+    });
+    is-deeply @terminals.map(*<event>).List, ('queue/job-superseded',),
+        'exactly one terminal event, and it is superseded';
+};
+
+subtest 'cancel racing runner completion emits exactly one terminal event' => {
+    plan 1;
+    my Int $bad = 0;
+    for ^100 -> $i {
+        my $probe = ProbeStore.new;
+        my $gate = Promise.new;
+        my $q = JobQueue::Queue.new(
+            name            => "race-$i",
+            store           => $probe,
+            is-parallel-now => -> { True },
+            run-job         => -> $job { start { await $gate; 'done' } },
+        );
+        my $job = $q.enqueue(make-job(1));
+        wait-for(-> { $q.running-count == 1 });
+        # Trip completion and cancellation as close together as we can.
+        my $c = start { $q.cancel($job.id) };
+        $gate.keep;
+        await $c;
+        await $job.completion;
+        wait-for(-> { $q.running-count == 0 });
+        my @terminals = $probe.events.grep({
+            $_<event> ∈ @TERMINAL-EVENTS && $_<job><id> eq $job.id
+        });
+        $bad++ if @terminals.elems != 1;
+    }
+    is $bad, 0, '100 races, one terminal event each';
+};
+
+subtest 'cancel running: cancelling announced, terminal deferred to drain end' => {
+    # The drain still physically occupies the backend, so the ledger
+    # must not drop the row at cancel time: cancel announces the
+    # non-terminal queue/job-cancelling and the terminal fires from
+    # the then-hook once the runner actually unwinds.
+    plan 9;
+    my $probe = ProbeStore.new;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'defer-cancel',
+        store           => $probe,
+        is-parallel-now => -> { False },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g }
+        },
+    );
+    my $a = $q.enqueue(make-job(1));
+    wait-for(-> { $q.running-count == 1 });
+    ok $q.cancel($a.id), 'cancel won the terminal transition';
+
+    my @cancelling = $probe.events.grep({ $_<event> eq 'queue/job-cancelling' });
+    is @cancelling.elems, 1, 'cancelling announced synchronously';
+    is @cancelling[0]<job><state>, 'cancelling', 'snapshot state pinned to cancelling';
+    is @cancelling[0]<job><phase>, 'cancelling', 'snapshot phase pinned to cancelling';
+    nok @cancelling[0]<job><cancellable>, 'cancelling row is not cancellable';
+    is $probe.events.grep({ $_<event> ∈ @TERMINAL-EVENTS }).elems, 0,
+        'no terminal event while the runner still drains';
+    is $q.live-count, 0, 'drainer is not live work';
+
+    %gates{$a.id}.keep('done');
+    wait-for(-> { $q.running-count == 0 });
+    wait-for(-> { $probe.events.grep({ $_<event> ∈ @TERMINAL-EVENTS }).elems > 0 });
+    my @terms = $probe.events.grep({ $_<event> ∈ @TERMINAL-EVENTS });
+    is @terms.elems, 1, 'exactly one terminal at drain end';
+    is @terms[0]<event>, 'queue/job-cancelled', 'deferred terminal is job-cancelled';
+};
+
+subtest 'deferred supersede terminal keyed on the kept completion value' => {
+    # The runner promise resolving with a junk value must not change
+    # the outcome: the then-hook routes on completion.result, which
+    # the winning cancel(:outcome<superseded>) fixed at cancel time.
+    plan 3;
+    my $probe = ProbeStore.new;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'defer-supersede',
+        store           => $probe,
+        is-parallel-now => -> { False },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g }
+        },
+    );
+    my $a = $q.enqueue(make-job(1));
+    wait-for(-> { $q.running-count == 1 });
+    $q.cancel($a.id, outcome => 'superseded');
+    is $probe.events.grep({ $_<event> ∈ @TERMINAL-EVENTS }).elems, 0,
+        'supersede of a running job also defers its terminal';
+    %gates{$a.id}.keep('done');
+    wait-for(-> { $q.running-count == 0 });
+    wait-for(-> { $probe.events.grep({ $_<event> ∈ @TERMINAL-EVENTS }).elems > 0 });
+    my @terms = $probe.events.grep({ $_<event> ∈ @TERMINAL-EVENTS });
+    is @terms.elems, 1, 'exactly one terminal';
+    is @terms[0]<event>, 'queue/job-superseded',
+        'terminal routed on the kept superseded outcome';
+};
+
+subtest 'runner self-finish cancelled emits job-cancelled, not job-failed' => {
+    # A runner that observes the token first (self-finishing with
+    # 'cancelled') used to fall into the then-hook's default branch
+    # and mislabel a user cancel as a red job-failed.
+    plan 2;
+    my $probe = ProbeStore.new;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'self-cancel',
+        store           => $probe,
+        is-parallel-now => -> { False },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start {
+                await $g;
+                $job.finish('cancelled');
+                'cancelled';
+            }
+        },
+    );
+    my $a = $q.enqueue(make-job(1));
+    wait-for(-> { $q.running-count == 1 });
+    %gates{$a.id}.keep(True);
+    wait-for(-> { $q.running-count == 0 });
+    wait-for(-> { $probe.events.grep({ $_<event> ∈ @TERMINAL-EVENTS }).elems > 0 });
+    my @terms = $probe.events.grep({ $_<event> ∈ @TERMINAL-EVENTS });
+    is @terms.elems, 1, 'exactly one terminal event';
+    is @terms[0]<event>, 'queue/job-cancelled',
+        'self-finished cancelled routes to job-cancelled';
+};
+
+subtest 'begin-running loses atomically to an earlier terminal' => {
+    # Guards the tick→start window: a cancel that wins between the
+    # queue publishing the job to its running set and the runner spawn
+    # must not be clobbered back to state running (the deferred
+    # terminal routes on completion.result, but snapshots read state).
+    plan 4;
+    my $job = make-job(1);
+    ok $job.begin-running, 'begin-running wins on a fresh job';
+    is $job.state, 'running', 'state advanced';
+    my $late = make-job(1);
+    $late.request-cancel;
+    $late.finish('cancelled', :by<cancel>);
+    nok $late.begin-running, 'begin-running loses after a terminal';
+    is $late.state, 'cancelled', 'terminal state not clobbered';
+};
+
+subtest 'priority: pipeline-critical pending jobs win freed slots' => {
+    plan 6;
+    # The production carrier of the non-zero level: a short
+    # pipeline-critical sub-job must overtake queued bulk work so the
+    # pipeline waiting on it never sits a full bulk-job behind work
+    # that could just as well run later.
+    is PriorityJob.new(scope-id => 1).priority, 10,
+        'a job class can ship the pipeline-critical priority';
+    my $probe = ProbeStore.new;
+    my %gates;
+    my @started;
+    my $q = JobQueue::Queue.new(
+        name            => 'priority',
+        store           => $probe,
+        is-parallel-now => -> { False },
+        run-job         => -> $job {
+            @started.push: $job.id;
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g }
+        },
+    );
+    # A occupies the serial slot; B (laned) and D (plain) queue ahead
+    # of C (priority 10) in FIFO terms.
+    my $a = $q.enqueue(make-job(1));
+    wait-for(-> { $q.running-count == 1 });
+    my $b = $q.enqueue(make-job(1, lane => 'state:1'));
+    my $d = $q.enqueue(make-job(1));
+    my $c = $q.enqueue(make-job(1, priority => 10));
+    is $q.pending-count, 3, 'three pending behind the serial head';
+
+    %gates{$a.id}.keep('done');
+    wait-for(-> { @started.elems == 2 });
+    is @started[1], $c.id, 'priority job overtakes both earlier arrivals';
+
+    %gates{$c.id}.keep('done');
+    wait-for(-> { @started.elems == 3 });
+    is @started[2], $b.id, 'FIFO resumes within the zero level';
+
+    %gates{$b.id}.keep('done');
+    wait-for(-> { @started.elems == 4 });
+    is @started[3], $d.id, 'remaining zero-level job last';
+    %gates{$d.id}.keep('done');
+    wait-for(-> { $q.total-count == 0 });
+
+    # Lane-blocked priority jobs are skipped, not blocking: with the
+    # 'busy' lane occupied, the priority job in that lane pends while
+    # a plain job overtakes it.
+    my %gates2;
+    my @started2;
+    my $q2 = JobQueue::Queue.new(
+        name            => 'priority-lane',
+        is-parallel-now => -> { True },
+        run-job         => -> $job {
+            @started2.push: $job.id;
+            %gates2{$job.id} = my $g = Promise.new;
+            start { await $g }
+        },
+    );
+    my $l1 = $q2.enqueue(make-job(1, lane => 'busy'));
+    wait-for(-> { $q2.running-count == 1 });
+    my $lp = $q2.enqueue(make-job(1, lane => 'busy', priority => 10));
+    my $plain = $q2.enqueue(make-job(1));
+    wait-for(-> { @started2.elems == 2 });
+    is @started2[1], $plain.id,
+        'lane-blocked priority job does not block the free-lane job';
+    %gates2{$l1.id}.keep('done');
+    wait-for(-> { @started2.elems == 3 });
+    %gates2{$lp.id}.keep('done');
+    %gates2{$plain.id}.keep('done');
+    wait-for(-> { $q2.total-count == 0 });
+};
+
+subtest 'find-job, find-by-dedup-key and the count family' => {
+    # The read-only surface the UI leans on. Never covered directly in
+    # the original suite, but every one of these is load-bearing for a
+    # queue modal.
+    plan 8;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-lookups',
+        is-parallel-now => -> { False },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    ok $q.is-empty, 'a fresh queue is empty';
+    my $running = $q.enqueue(make-job(1, dedup-key => 'LK'));
+    wait-for(-> { %gates{$running.id}:exists });
+    my $pending = $q.enqueue(make-job(1));
+
+    is $q.find-job($running.id).id, $running.id, 'finds a running job';
+    is $q.find-job($pending.id).id, $pending.id, 'finds a pending job';
+    nok $q.find-job('nope').defined, 'unknown id returns Nil';
+    is $q.find-by-dedup-key('LK').id, $running.id, 'finds by dedup key';
+    nok $q.find-by-dedup-key('missing').defined, 'unknown key returns Nil';
+    is $q.total-count, 2, 'total counts running + pending';
+    is $q.running-jobs.elems + $q.pending-jobs.elems, 2,
+        'the job snapshots agree with the counts';
+
+    %gates{$running.id}.keep;
+    await $running.completion;
+    wait-for(-> { %gates{$pending.id}:exists });
+    %gates{$pending.id}.keep;
+    await $pending.completion;
+};
+
+subtest 'keep-once settles bare promises without racing throws' => {
+    # Done/end promises are kept from BOTH a tick thread (finish) and
+    # worker threads (cancel). The old `keep unless Kept` check-then-
+    # act let the loser throw "Promise already kept" — unobserved on a
+    # worker, frame-fatal on the tick thread. keep-once's try IS the
+    # atomic test-and-set; hammer it from many threads to prove no
+    # throw escapes and exactly one keeper wins.
+    plan 5;
+    my $p = Promise.new;
+    ok keep-once($p, 'first'), 'first keeper wins';
+    nok keep-once($p, 'second'), 'second keeper loses quietly';
+    is $p.result, 'first', "winner's value stands";
+    nok keep-once(Promise, 'x'), 'undefined promise is a no-op';
+
+    my $races = Promise.new;
+    my atomicint $wins = 0;
+    await (^16).map: -> $i {
+        start {
+            atomic-fetch-inc($wins) if keep-once($races, "racer-$i");
+        }
+    }
+    is atomic-fetch($wins), 1, 'exactly one of 16 concurrent keepers won';
+};
