@@ -4,7 +4,7 @@ use lib 'lib';
 use JobQueue::Job;
 use JobQueue::Queue;
 
-plan 23;
+plan 24;
 
 my constant @TERMINAL-EVENTS = <
     queue/job-finished queue/job-failed
@@ -48,8 +48,9 @@ sub make-job($scope, *%extra) {
 # which queue/* events fired and with what payload.
 class ProbeStore {
     has @.events;
+    has Lock $!lock .= new;
     method dispatch(Str:D $event, *%payload) {
-        @!events.push: %( :$event, |%payload );
+        $!lock.protect: { @!events.push: %( :$event, |%payload ) };
     }
 }
 
@@ -406,6 +407,45 @@ subtest 'dedup-key: live job wins, terminal job re-enqueues' => {
     %gates{$c.id}.keep if %gates{$c.id}.defined;
     await $c.completion;
     ok True, 'fresh keyed job completes';
+};
+
+subtest 'dedup-key lookup and enqueue are atomic across callers' => {
+    plan 5;
+    my $probe = ProbeStore.new;
+    my $run-gate = Promise.new;
+    my $q = JobQueue::Queue.new(
+        name            => 'test-concurrent-dedup',
+        store           => $probe,
+        is-parallel-now => -> { True },
+        run-job         => -> $job { start { await $run-gate; 'done' } },
+    );
+
+    my $start = Promise.new;
+    my Lock $answers-lock .= new;
+    my @answers;
+    my @callers = ^32 .map: {
+        start {
+            await $start;
+            my $answer = $q.enqueue(make-job(1, dedup-key => 'shared-key'));
+            $answers-lock.protect: { @answers.push: $answer };
+        }
+    };
+    $start.keep;
+    await Promise.allof(|@callers);
+
+    is @answers.elems, 32, 'every caller received a job';
+    is @answers.map(*.id).unique.elems, 1,
+        'every caller received the same live job identity';
+    is $q.total-count, 1, 'only one physical job exists';
+    is $probe.events.grep(*.<event> eq 'queue/job-enqueued').elems, 1,
+        'only one enqueue event was emitted';
+
+    $run-gate.keep;
+    await @answers.head.completion;
+    wait-for(-> { $q.total-count == 0 });
+    my $fresh = $q.enqueue(make-job(1, dedup-key => 'shared-key'));
+    isnt $fresh.id, @answers.head.id,
+        'the key may be enqueued again after the original becomes terminal';
 };
 
 subtest 'lanes: serial per lane, FIFO within, cross-lane overtake' => {

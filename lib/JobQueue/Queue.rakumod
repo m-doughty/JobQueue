@@ -256,24 +256,27 @@ method enqueue(Job:D $job --> Job:D) {
     # nothing is enqueued. Cancel/supersede keep the completion
     # Promise synchronously, so a cancelled-but-still-draining job
     # never absorbs a fresh enqueue (the rapid A→B→A case).
-    if $job.dedup-key.chars {
-        my $existing = $!lock.protect: {
-            %!running.values.first({
+    my $existing;
+    # Lookup and insertion are one state transition. Splitting them across
+    # two lock acquisitions lets concurrent callers both observe a miss and
+    # enqueue the same key, which defeats the whole dedup contract precisely
+    # when a queue has several producers.
+    $!lock.protect: {
+        if $job.dedup-key.chars {
+            $existing = %!running.values.first({
                 .dedup-key eq $job.dedup-key && .completion.status !~~ Kept
             }) // @!pending.first({
                 .dedup-key eq $job.dedup-key && .completion.status !~~ Kept
             });
-        };
-        with $existing {
-            $.log.debug("$!name/job-deduped",
-                :key($job.dedup-key), :existing-id($_.id),
-                :dropped-id($job.id));
-            $span.finish(deduped => True) with $span;
-            return $_;
         }
+        @!pending.push: $job unless $existing.defined;
     }
-    $!lock.protect: {
-        @!pending.push: $job;
+    with $existing {
+        $.log.debug("$!name/job-deduped",
+            :key($job.dedup-key), :existing-id($_.id),
+            :dropped-id($job.id));
+        $span.finish(deduped => True) with $span;
+        return $_;
     }
     self!dispatch-event('queue/job-enqueued', $job);
     self.tick;
