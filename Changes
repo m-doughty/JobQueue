@@ -2,6 +2,22 @@ Revision history for JobQueue
 
 {{$NEXT}}
 
+0.1.2  2026-10-05T10:53:36+01:00
+    - Retain a bounded FIFO cache of terminal dependency outcomes in
+      JobQueue::Coordinator. Late hard/soft dependents submitted after
+      a predecessor Job object is pruned now resolve the predecessor's
+      done, failure, cancelled or superseded outcome instead of treating
+      it as unknown; evicted hard/soft dependencies keep the existing
+      unknown-dependency behavior.
+    - Record each Job's last dependency-readiness decision as compact
+      scalar metadata exposed through dependency-state and included in
+      queue snapshots, so observers can explain blocked, doomed and
+      released jobs without re-running scheduler logic or retaining
+      dependency result bodies.
+    - Add Queue.physical-job-ids for an atomic pending+running id
+      snapshot that includes cancelled or superseded runners until
+      their physical drain completes.
+
 0.1.1  2026-08-21T21:30:35+01:00
     - Make dedup lookup plus pending insertion one atomic queue transition.
       Concurrent producers of one live key now all receive the same job;

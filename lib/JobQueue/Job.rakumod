@@ -139,6 +139,21 @@ Cancellation is cooperative by construction: the queue keeps the
 token and calls your C<on-cancel>; B<the runner> is responsible for
 actually unwinding.
 
+=head2 Dependency readiness
+
+When a C<JobQueue::Coordinator> holds or releases a job, it records a
+compact C<dependency-state> report on the job from the same dependency
+resolution pass that drove the scheduling decision. The report has
+C<status> C<ready>, C<blocked> or C<doomed>; non-ready reports also
+carry the first relevant prerequisite id, edge kind, observed
+prerequisite state, and the required state. C<prerequisite-state> is
+C<unknown>, a known live job state such as C<pending> or C<running>,
+or the exact terminal outcome string such as C<done>, C<error>,
+C<cancelled> or C<superseded>. An empty Hash means no coordinator
+report has been recorded. Reports deliberately contain only exact
+scalar metadata, never a dependency's C<result> body; application
+boundaries can impose their own narrower id vocabulary.
+
 =head1 EXPORTS
 
 The C<Job> role and the C<keep-once> sub. Both are also package-scoped
@@ -272,6 +287,13 @@ role Job is export {
         DAG's data handoff. )
     has %.dep-results is rw;
 
+    # Last coordinator dependency-readiness report. It is kept after
+    # terminal completion so observers can still explain why a held
+    # job released, blocked, or was superseded.
+    has %!dependency-state;
+
+    has Lock $!dependency-state-lock = Lock.new;
+
     # One lock guards both terminal transitions. finish/request-cancel
     # race from the queue then-hook, cancel paths, and runners; the
     # boolean return tells the caller whether IT performed the
@@ -333,6 +355,82 @@ role Job is export {
             $!state = 'running';
             $!started-at = now;
             True;
+        }
+    }
+
+    #|( Return the last dependency readiness report as detached
+        top-level data. Empty means the job has not been coordinator-
+        resolved yet. )
+    method dependency-state(--> Hash) {
+        $!dependency-state-lock.protect: {
+            my %copy;
+            %copy{.key} = .value for %!dependency-state.pairs;
+            %copy;
+        }
+    }
+
+    #|( Replace the last dependency readiness report. The coordinator
+        is the intended caller; validation keeps this observability
+        field compact and scalar-only so it is safe for snapshots. )
+    method record-dependency-state(%report --> Nil) {
+        my %copy = self!validate-dependency-state(%report);
+        $!dependency-state-lock.protect: {
+            %!dependency-state = %copy;
+        }
+    }
+
+    method !validate-dependency-state(%report --> Hash) {
+        my $allowed = Set.new(<
+            status prerequisite-id edge prerequisite-state required-state
+        >);
+        for %report.keys -> $key {
+            die "JobQueue::Job: dependency-state.$key is not a supported key"
+                unless $allowed{$key};
+        }
+
+        my $status = %report<status>;
+        die "JobQueue::Job: dependency-state.status must be ready, blocked or doomed"
+            unless $status ~~ Str:D && $status ∈ <ready blocked doomed>;
+
+        my %out = status => $status;
+        if $status eq 'ready' {
+            die "JobQueue::Job: dependency-state.ready reports cannot carry prerequisite fields"
+                if %report.keys.elems > 1;
+            return %out;
+        }
+
+        for <prerequisite-id edge prerequisite-state required-state> -> $key {
+            die "JobQueue::Job: dependency-state.$key must be a string"
+                unless %report{$key} ~~ Str:D;
+        }
+        die "JobQueue::Job: dependency-state.edge must be depends-on or after"
+            unless %report<edge> ∈ <depends-on after>;
+        die "JobQueue::Job: dependency-state.required-state must be done or terminal"
+            unless %report<required-state> ∈ <done terminal>;
+        die "JobQueue::Job: dependency-state.required-state does not match edge"
+            unless %report<required-state> eq
+                (%report<edge> eq 'depends-on' ?? 'done' !! 'terminal');
+        die "JobQueue::Job: only hard dependencies can be doomed"
+            if $status eq 'doomed' && %report<edge> ne 'depends-on';
+
+        %out<prerequisite-id> = %report<prerequisite-id>;
+        %out<edge> = %report<edge>;
+        %out<prerequisite-state> = %report<prerequisite-state>;
+        %out<required-state> = %report<required-state>;
+        %out;
+    }
+
+    #|( Atomic state observation for scheduler diagnostics. The
+        terminal lock makes the completion status/result and display
+        state one coherent read, so a dependency report cannot pair a
+        pre-finish status with a post-finish state. )
+    method dependency-observation(--> Hash) {
+        $!terminal-lock.protect: {
+            my Bool $terminal = $!completion.status ~~ Kept;
+            %(
+                terminal => $terminal,
+                state    => ($terminal ?? $!completion.result.Str !! $!state),
+            );
         }
     }
 

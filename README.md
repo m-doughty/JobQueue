@@ -79,7 +79,7 @@ $coord.submit('text',  AuditJob.new(scope-id => $doc, after      => [$summary.id
 $coord.tick;    # per frame: release, supersede, pump, prune
 ```
 
-Hard edges (`depends-on`) require their dependency to finish `done`, and a failure cascades transitively as `superseded`. Soft edges (`after`) only wait for a terminal state and run regardless of the outcome. Each dependency's `state` and `result` land in the dependent's `dep-results` at release.
+Hard edges (`depends-on`) require their dependency to finish `done`, and a failure cascades transitively as `superseded`. Soft edges (`after`) only wait for a terminal state and run regardless of the outcome. Each dependency's `state` and `result` land in the dependent's `dep-results` at release. Completed predecessors may be pruned from live bookkeeping, but the coordinator keeps a bounded terminal-outcome cache so a dependent submitted shortly after pruning still sees the predecessor's `state`, `result` and `dep-extras`. Every dependency resolution also records a compact `dependency-state` report on the job: `ready`, `blocked` or `doomed`, plus the first relevant prerequisite id, edge, observed state and required state for non-ready jobs.
 
 `JobQueue::FailedRegistry` — retry with identical inputs
 --------------------------------------------------------
@@ -107,9 +107,11 @@ These are not incidental behaviours; they are the contracts the implementation e
 
   * **`note-phase` / `note-progress` are guarded.** Terminal, cancelled, or not-currently-running jobs are ignored, so a late note from a straggling worker can never resurrect a finished row.
 
+  * **Pruned terminal dependency outcomes remain briefly addressable.** The coordinator retains a bounded FIFO cache of terminal `dep-results` payloads, so asynchronous DAG extension can attach a dependent after its predecessor Job object was pruned without misclassifying that predecessor as unknown. The cache stores the same top-level handoff Hash shape the dependent receives: `state`, `result` and filtered `dep-extras`. The coordinator itself adds no Job object, Promise or Lock to that handoff; values supplied by `result` and `dep-extras` keep their normal Raku reference semantics. When the cache evicts, hard and soft edges use the normal unknown-dependency rules.
+
   * **A misbehaving runner cannot stall the queue.** A runner returning a non-Promise is coerced to a kept one; a runner that throws has its exception message captured onto `$job.error` and becomes a normal failure terminal.
 
-  * **`live-count` and `total-count` are different questions.** Lock a reply box on the former (what the user waits for); size a backend pool with the latter (what physically occupies it).
+  * **`live-count` and `total-count` are different questions.** Lock a reply box on the former (what the user waits for); size a backend pool with the latter (what physically occupies it). `physical-job-ids` returns the atomic id snapshot behind the physical view, including cancelled/superseded runners until their drain actually ends.
 
 THE STORE SINK CONTRACT
 =======================
@@ -126,7 +128,7 @@ and the queue always calls it in exactly one shape:
 $store.dispatch($event, queue => $queue-name, job => %snapshot);
 ```
 
-`%snapshot` comes from `JobQueue::Queue.job-snapshot`: plain scalars only — id, scope-id, state, timestamps, lane, priority, phase, `error`, plus whatever your class's `snapshot-extras` adds. It is safe to drop into a Redux-style store, serialise, or send over a socket. The full Job object is not: it holds Promises, closures and a Lock.
+`%snapshot` comes from `JobQueue::Queue.job-snapshot`: plain scalars only — id, scope-id, state, timestamps, lane, priority, phase, `error`, the coordinator's compact `dependency-state` report when present, plus whatever your class's `snapshot-extras` adds. `dependency-state` is queue-owned, so `snapshot-extras` cannot override it. It is safe to drop into a Redux-style store, serialise, or send over a socket. The full Job object is not: it holds Promises, closures and a Lock.
 
 `$.store` is untyped so any object answering `dispatch` works. `JobQueue::EventSink` names the contract if you want the compile-time check:
 

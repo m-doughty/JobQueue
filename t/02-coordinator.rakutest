@@ -9,7 +9,7 @@ use JobQueue::Coordinator;
 # dep-result injection, cascade supersede, cross-queue edges, dedup
 # across held + queued jobs.
 
-plan 12;
+plan 19;
 
 class TestJob does Job {
     has Str $.kind = 'test';
@@ -18,6 +18,17 @@ class TestJob does Job {
 
     method dep-extras(--> Hash) {
         $!message-id.defined ?? %( message-id => $!message-id ) !! %();
+    }
+}
+
+class MidTickFinisherJob does Job {
+    has Str $.kind = 'mid-tick-finisher';
+    has $.finish-target is required;
+
+    method dep-extras(--> Hash) {
+        $!finish-target.result = %( finished => 'during-tick' );
+        $!finish-target.finish('done');
+        %()
     }
 }
 
@@ -56,6 +67,27 @@ sub make-coord(%gates, :$store) {
 
 sub job($scope = 1, *%extra) {
     TestJob.new(scope-id => $scope, |%extra);
+}
+
+sub finish-and-prune($coord, %gates, $job, Str:D $outcome --> Nil) {
+    wait-for(-> { %gates{$job.id}:exists });
+    given $outcome {
+        when 'cancelled' {
+            $coord.cancel($job.id);
+            %gates{$job.id}.keep('done');
+        }
+        when 'superseded' {
+            $coord.supersede($job.id);
+            %gates{$job.id}.keep('done');
+        }
+        default {
+            %gates{$job.id}.keep($outcome);
+        }
+    }
+    await $job.completion;
+    wait-for(-> { $coord.queue($job.queue-name).total-count == 0 });
+    $coord.tick;
+    wait-for(-> { !$coord.find-job($job.id).defined });
 }
 
 subtest 'independent job dispatches immediately' => {
@@ -250,6 +282,368 @@ subtest 'unknown SOFT dependency is skipped, not doomed' => {
     %gates{$child.id}.keep('done');
     await $child.completion;
     is $child.state, 'done', 'completed normally';
+};
+
+subtest 'dependency-state reports scheduler readiness decisions' => {
+    plan 25;
+
+    my %gates;
+    my $coord = make-coord(%gates);
+    my $first = $coord.submit('q-a', job());
+    my $second = $coord.submit('q-a', job());
+    my $child = $coord.submit('q-b', job(1,
+        depends-on => [$first.id, $second.id]));
+    wait-for(-> { (%gates{$first.id}:exists) && (%gates{$second.id}:exists) });
+
+    is $child.dependency-state<status>, 'blocked',
+        'hard dependent reports blocked while first hard dep runs';
+    is $child.dependency-state<prerequisite-id>, $first.id,
+        'first hard blocker is reported';
+    is $child.dependency-state<required-state>, 'done',
+        'hard blocker reports required done state';
+
+    %gates{$first.id}.keep('done');
+    await $first.completion;
+    $coord.tick;
+    is $child.dependency-state<status>, 'blocked',
+        'child remains blocked after only first dep completes';
+    is $child.dependency-state<prerequisite-id>, $second.id,
+        'first blocker advances to the remaining hard dep';
+
+    %gates{$second.id}.keep('done');
+    await $second.completion;
+    $coord.tick;
+    wait-for(-> { %gates{$child.id}:exists });
+    is $child.dependency-state<status>, 'ready',
+        'hard dependent reports ready from the releasing resolution pass';
+    ok %gates{$child.id}:exists, 'ready child was released';
+    %gates{$child.id}.keep('done');
+    await $child.completion;
+
+    my %failure-gates;
+    my $failure-coord = make-coord(%failure-gates);
+    my $waiting = $failure-coord.submit('q-a', job());
+    my $failing = $failure-coord.submit('q-a', job());
+    my $doomed = $failure-coord.submit('q-b', job(1,
+        depends-on => [$waiting.id, $failing.id]));
+    wait-for(-> {
+        (%failure-gates{$waiting.id}:exists)
+        && (%failure-gates{$failing.id}:exists)
+    });
+    is $doomed.dependency-state<prerequisite-id>, $waiting.id,
+        'earlier hard wait is reported before failure exists';
+    %failure-gates{$failing.id}.keep('error');
+    await $failing.completion;
+    $failure-coord.tick;
+    wait-for(-> { $doomed.completion.status ~~ Kept });
+    is $doomed.dependency-state<status>, 'doomed',
+        'hard failure dominates an earlier waiting hard dep';
+    is $doomed.dependency-state<prerequisite-id>, $failing.id,
+        'doomed report identifies the failed hard dep';
+    is $doomed.dependency-state<prerequisite-state>, 'error',
+        'doomed report carries the terminal failure state';
+    is $doomed.state, 'superseded', 'doomed child was superseded';
+    %failure-gates{$waiting.id}.keep('done');
+    await $waiting.completion;
+
+    my %unknown-gates;
+    my $unknown-coord = make-coord(%unknown-gates);
+    my $unknown-hard = $unknown-coord.submit('q-a',
+        job(1, depends-on => ['missing-hard']));
+    wait-for(-> { $unknown-hard.completion.status ~~ Kept });
+    is $unknown-hard.dependency-state<status>, 'doomed',
+        'unknown hard dependency reports doomed';
+    is $unknown-hard.dependency-state<prerequisite-state>, 'unknown',
+        'unknown hard dependency reports unknown state';
+
+    my $unknown-soft = $unknown-coord.submit('q-a',
+        job(1, after => ['missing-soft']));
+    wait-for(-> { %unknown-gates{$unknown-soft.id}:exists });
+    is $unknown-soft.dependency-state<status>, 'ready',
+        'unknown soft dependency is ignored as ready';
+    ok %unknown-gates{$unknown-soft.id}:exists,
+        'unknown-soft job was released';
+    %unknown-gates{$unknown-soft.id}.keep('done');
+    await $unknown-soft.completion;
+
+    my %soft-gates;
+    my $soft-coord = make-coord(%soft-gates);
+    my $soft-dep = $soft-coord.submit('q-a', job());
+    my $soft-child = $soft-coord.submit('q-b',
+        job(1, after => [$soft-dep.id]));
+    wait-for(-> { %soft-gates{$soft-dep.id}:exists });
+    is $soft-child.dependency-state<status>, 'blocked',
+        'soft dependent reports blocked while precursor runs';
+    is $soft-child.dependency-state<edge>, 'after',
+        'soft blocker records after edge';
+    is $soft-child.dependency-state<required-state>, 'terminal',
+        'soft blocker requires any terminal state';
+    is $soft-child.dependency-state<prerequisite-state>, 'running',
+        'soft blocker reports known nonterminal state';
+
+    %soft-gates{$soft-dep.id}.keep('error');
+    await $soft-dep.completion;
+    $soft-coord.tick;
+    wait-for(-> { %soft-gates{$soft-child.id}:exists });
+    is $soft-child.dependency-state<status>, 'ready',
+        'soft dependent reports ready after failed terminal outcome';
+    is $soft-child.dep-results{$soft-dep.id}<state>, 'error',
+        'soft dependent still receives the failed terminal handoff';
+
+    my %detached = $soft-child.dependency-state;
+    %detached<status> = 'mutated';
+    is $soft-child.dependency-state<status>, 'ready',
+        'dependency-state getter returns detached data';
+    nok $soft-child.dependency-state<result>:exists,
+        'dependency-state report contains no dependency result body';
+    %soft-gates{$soft-child.id}.keep('done');
+    await $soft-child.completion;
+    $soft-coord.tick;
+    is $soft-child.dependency-state<status>, 'ready',
+        'last dependency-state remains after terminal and pruning';
+};
+
+subtest 'explicit hard cascade records actual failed prerequisite' => {
+    plan 14;
+
+    for <cancelled superseded> -> $outcome {
+        my %gates;
+        my $probe = ProbeStore.new;
+        my $coord = make-coord(%gates, store => $probe);
+
+        my $earlier = $coord.submit('q-a', job());
+        my $actual = $coord.submit('q-a', job());
+        my $child = $coord.submit('q-b', job(1,
+            depends-on => [$earlier.id, $actual.id]));
+        wait-for(-> {
+            (%gates{$earlier.id}:exists) && (%gates{$actual.id}:exists)
+        });
+
+        is $child.dependency-state<prerequisite-id>, $earlier.id,
+            "$outcome cascade starts with earlier hard wait reported";
+
+        if $outcome eq 'cancelled' {
+            ok $coord.cancel($actual.id), 'explicit cancel won';
+        } else {
+            ok $coord.supersede($actual.id), 'explicit supersede won';
+        }
+        wait-for(-> { $child.completion.status ~~ Kept });
+
+        is $child.dependency-state<status>, 'doomed',
+            "$outcome cascade records doomed report";
+        is $child.dependency-state<prerequisite-id>, $actual.id,
+            "$outcome cascade reports the actual failed prerequisite";
+        is $child.dependency-state<prerequisite-state>, $outcome,
+            "$outcome cascade reports the exact prerequisite outcome";
+        is $child.state, 'superseded',
+            "$outcome cascade superseded the held child";
+
+        my $ev = $probe.events.first({
+            $_<event> eq 'queue/job-superseded'
+            && $_<job><id> eq $child.id
+        });
+        is $ev<job><dependency-state><prerequisite-id>, $actual.id,
+            "$outcome terminal snapshot includes the cascade report";
+
+        %gates{$actual.id}.keep('done');
+        %gates{$earlier.id}.keep('done');
+        await Promise.allof($actual.completion, $earlier.completion);
+    }
+};
+
+subtest 'late dependents use retained outcomes after predecessor prune' => {
+    plan 22;
+    for <done error cancelled superseded> -> $outcome {
+        my %gates;
+        my $coord = make-coord(%gates);
+        my $dep = $coord.submit('q-a', job());
+        $dep.message-id = 700 + $outcome.chars;
+        $dep.result = %( outcome => $outcome );
+
+        finish-and-prune($coord, %gates, $dep, $outcome);
+        nok $coord.find-job($dep.id).defined,
+            "$outcome predecessor pruned before late submit";
+
+        my $hard = $coord.submit('q-a', job(1, depends-on => [$dep.id]));
+        if $outcome eq 'done' {
+            wait-for(-> { %gates{$hard.id}:exists });
+            ok %gates{$hard.id}:exists,
+                'late hard dependent runs after retained success';
+            is $hard.dep-results{$dep.id}<state>, 'done',
+                'late hard dependent sees retained done state';
+            is $hard.dep-results{$dep.id}<result><outcome>, $outcome,
+                'late hard dependent sees retained result';
+            is $hard.dep-results{$dep.id}<message-id>, $dep.message-id,
+                'late hard dependent sees retained dep-extras';
+            %gates{$hard.id}.keep('done');
+            await $hard.completion;
+        } else {
+            wait-for(-> { $hard.completion.status ~~ Kept });
+            is $hard.state, 'superseded',
+                "late hard dependent superseded after retained $outcome";
+            nok %gates{$hard.id}:exists,
+                "late hard dependent never runs after retained $outcome";
+        }
+
+        my $soft = $coord.submit('q-b', job(1, after => [$dep.id]));
+        wait-for(-> { %gates{$soft.id}:exists });
+        ok %gates{$soft.id}:exists,
+            "late soft dependent runs after retained $outcome";
+        is $soft.dep-results{$dep.id}<state>, $outcome,
+            "late soft dependent sees retained $outcome state";
+        %gates{$soft.id}.keep('done');
+        await $soft.completion;
+    }
+};
+
+subtest 'retained outcomes support late dependency chains' => {
+    plan 8;
+    my %gates;
+    my $coord = make-coord(%gates);
+
+    my $root = $coord.submit('q-a', job());
+    $root.result = %( stage => 'root' );
+    finish-and-prune($coord, %gates, $root, 'done');
+
+    my $middle = $coord.submit('q-a', job(1, depends-on => [$root.id]));
+    wait-for(-> { %gates{$middle.id}:exists });
+    ok %gates{$middle.id}:exists, 'middle released from retained root';
+    is $middle.dep-results{$root.id}<result><stage>, 'root',
+        'middle sees retained root result';
+    $middle.result = %( stage => 'middle' );
+    finish-and-prune($coord, %gates, $middle, 'done');
+    nok $coord.find-job($middle.id).defined, 'middle pruned before leaf submit';
+
+    my $leaf = $coord.submit('q-b', job(1, depends-on => [$middle.id]));
+    wait-for(-> { %gates{$leaf.id}:exists });
+    ok %gates{$leaf.id}:exists, 'leaf released from retained middle';
+    is $leaf.dep-results{$middle.id}<state>, 'done',
+        'leaf sees retained middle state';
+    is $leaf.dep-results{$middle.id}<result><stage>, 'middle',
+        'leaf sees retained middle result';
+    nok $leaf.dep-results{$root.id}:exists,
+        'leaf receives only its declared dependency result';
+    %gates{$leaf.id}.keep('done');
+    await $leaf.completion;
+    is $leaf.state, 'done', 'late chain drains normally';
+};
+
+subtest 'mid-tick terminal jobs are not pruned without retention' => {
+    plan 5;
+    my %gates;
+    my $coord = make-coord(%gates);
+
+    my $victim = $coord.submit('q-a', job());
+    wait-for(-> { %gates{$victim.id}:exists });
+    my $finisher = $coord.submit('q-a', MidTickFinisherJob.new(
+        scope-id => 1,
+        finish-target => $victim,
+    ));
+    wait-for(-> { %gates{$finisher.id}:exists });
+
+    %gates{$finisher.id}.keep('done');
+    await $finisher.completion;
+    $coord.tick;
+
+    is $victim.state, 'done', 'second job became terminal during tick';
+    ok $coord.find-job($victim.id).defined,
+        'mid-tick terminal job remains coordinator-visible until next tick';
+
+    my $child = $coord.submit('q-b', job(1, depends-on => [$victim.id]));
+    wait-for(-> { %gates{$child.id}:exists });
+    ok %gates{$child.id}:exists,
+        'late hard dependent resolves mid-tick terminal predecessor';
+    is $child.dep-results{$victim.id}<result><finished>, 'during-tick',
+        'mid-tick predecessor result is injected';
+
+    %gates{$victim.id}.keep('done');
+    %gates{$child.id}.keep('done');
+    await Promise.allof($victim.completion, $child.completion);
+    is $child.state, 'done', 'dependent drains';
+};
+
+subtest 'held child pins cached terminal dependency until second dep finishes' => {
+    plan 6;
+    my %gates;
+    my $coord = JobQueue::Coordinator.new(terminal-outcome-limit => 1);
+    $coord.register-queue('q-a', make-queue('q-a', %gates));
+    $coord.register-queue('q-b', make-queue('q-b', %gates));
+
+    my $first = $coord.submit('q-a', job());
+    $first.result = %( stage => 'first' );
+    finish-and-prune($coord, %gates, $first, 'done');
+
+    my $second = $coord.submit('q-a', job());
+    wait-for(-> { %gates{$second.id}:exists });
+    my $child = $coord.submit('q-b', job(1,
+        depends-on => [$second.id, $first.id]));
+    nok %gates{$child.id}:exists, 'child waits on second dependency';
+
+    my $evictor = $coord.submit('q-b', job());
+    finish-and-prune($coord, %gates, $evictor, 'done');
+
+    $second.result = %( stage => 'second' );
+    %gates{$second.id}.keep('done');
+    await $second.completion;
+    $coord.tick;
+    wait-for(-> { %gates{$child.id}:exists });
+
+    ok %gates{$child.id}:exists,
+        'child releases after second dependency finishes';
+    is $child.dep-results{$first.id}<state>, 'done',
+        'first dependency state survived cache eviction while pinned';
+    is $child.dep-results{$first.id}<result><stage>, 'first',
+        'first dependency result survived cache eviction while pinned';
+    is $child.dep-results{$second.id}<result><stage>, 'second',
+        'second dependency result injected at release';
+
+    $child.dep-results{$second.id}<state> = 'mutated-copy';
+    my $late = $coord.submit('q-a', job(1, depends-on => [$second.id]));
+    wait-for(-> { %gates{$late.id}:exists });
+    is $late.dep-results{$second.id}<state>, 'done',
+        'mutating dep-results copy did not mutate retained outcome';
+
+    %gates{$late.id}.keep('done');
+    %gates{$child.id}.keep('done');
+    await Promise.allof($late.completion, $child.completion);
+};
+
+subtest 'terminal outcome retention is bounded' => {
+    plan 6;
+    my %gates;
+    my $coord = JobQueue::Coordinator.new(terminal-outcome-limit => 1);
+    $coord.register-queue('q-a', make-queue('q-a', %gates));
+
+    my $evicted = $coord.submit('q-a', job());
+    finish-and-prune($coord, %gates, $evicted, 'done');
+    my $retained = $coord.submit('q-a', job());
+    finish-and-prune($coord, %gates, $retained, 'done');
+
+    my $new-child = $coord.submit('q-a', job(1,
+        depends-on => [$retained.id]));
+    wait-for(-> { %gates{$new-child.id}:exists });
+    ok %gates{$new-child.id}:exists,
+        'newest retained hard dependency still releases';
+    is $new-child.dep-results{$retained.id}<state>, 'done',
+        'newest retained outcome injected';
+    %gates{$new-child.id}.keep('done');
+    await $new-child.completion;
+
+    my $old-child = $coord.submit('q-a', job(1,
+        depends-on => [$evicted.id]));
+    wait-for(-> { $old-child.completion.status ~~ Kept });
+    is $old-child.state, 'superseded',
+        'hard dependency older than retention bound is unknown';
+    nok %gates{$old-child.id}:exists, 'evicted hard dependent never ran';
+
+    my $soft-old = $coord.submit('q-a', job(1, after => [$evicted.id]));
+    wait-for(-> { %gates{$soft-old.id}:exists });
+    ok %gates{$soft-old.id}:exists,
+        'evicted soft dependency keeps unknown-soft behavior';
+
+    %gates{$soft-old.id}.keep('done');
+    await $soft-old.completion;
+    is $coord.total-active, 0, 'bounded-retention jobs drain';
 };
 
 subtest 'total-active counts live work only, never drainers' => {

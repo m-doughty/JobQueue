@@ -4,7 +4,7 @@ use lib 'lib';
 use JobQueue::Job;
 use JobQueue::Queue;
 
-plan 24;
+plan 27;
 
 my constant @TERMINAL-EVENTS = <
     queue/job-finished queue/job-failed
@@ -34,6 +34,16 @@ class TestJob does Job {
 class PriorityJob does Job {
     has Str $.kind = 'priority';
     submethod TWEAK() { $!priority = 10 }
+}
+
+class SnapshotSpoofJob does Job {
+    has Str $.kind = 'snapshot-spoof';
+
+    method snapshot-extras(--> Hash) {
+        %(
+            'dependency-state' => %( status => 'spoofed' ),
+        );
+    }
 }
 
 # Tests are gated on Promises rather than wall-clock sleeps so a
@@ -859,6 +869,156 @@ subtest 'find-job, find-by-dedup-key and the count family' => {
     wait-for(-> { %gates{$pending.id}:exists });
     %gates{$pending.id}.keep;
     await $pending.completion;
+};
+
+subtest 'physical-job-ids snapshots pending plus running drainers' => {
+    plan 7;
+    my %gates;
+    my $q = JobQueue::Queue.new(
+        name            => 'physical-ids',
+        is-parallel-now => -> { False },
+        run-job         => -> $job {
+            %gates{$job.id} = my $g = Promise.new;
+            start { await $g; 'done' }
+        },
+    );
+    my $running = $q.enqueue(make-job(1));
+    wait-for(-> { %gates{$running.id}:exists });
+    my $pending = $q.enqueue(make-job(1));
+    my $unsubmitted = make-job(1);
+
+    is-deeply $q.physical-job-ids.sort.List,
+        ($pending.id, $running.id).sort.List,
+        'physical snapshot includes pending and running jobs';
+
+    ok $q.cancel($running.id), 'running job was cancelled logically';
+    is $q.live-count, 1, 'only pending work remains logically live';
+    is-deeply $q.physical-job-ids.sort.List,
+        ($pending.id, $running.id).sort.List,
+        'cancelled running job remains physically resident while gated';
+    nok $q.physical-job-ids.first(* eq $unsubmitted.id).defined,
+        'unsubmitted job id is absent';
+
+    %gates{$running.id}.keep('done');
+    wait-for(-> { %gates{$pending.id}:exists });
+    is-deeply $q.physical-job-ids.List, ($pending.id,),
+        'drained cancelled job leaves the physical snapshot';
+
+    %gates{$pending.id}.keep('done');
+    wait-for(-> { $q.total-count == 0 });
+    is-deeply $q.physical-job-ids.List, (),
+        'snapshot is empty after all physical jobs drain';
+};
+
+subtest 'job-snapshot reserves dependency-state from extras' => {
+    plan 2;
+    my $q = JobQueue::Queue.new(
+        name            => 'snapshot-reserved',
+        is-parallel-now => -> { True },
+        run-job         => -> $job { start { 'done' } },
+    );
+    my $job = SnapshotSpoofJob.new(scope-id => 1);
+    my %empty = $q.job-snapshot($job);
+    nok %empty<dependency-state>:exists,
+        'subclass cannot create dependency-state through snapshot-extras';
+
+    $job.record-dependency-state(%( status => 'ready' ));
+    my %ready = $q.job-snapshot($job);
+    is-deeply %ready<dependency-state>, %( status => 'ready' ),
+        'recorded dependency-state is included in the snapshot';
+};
+
+subtest 'dependency-state validates shape and returns detached scalar report' => {
+    plan 14;
+    my $job = make-job(1);
+    is-deeply $job.dependency-state, %(),
+        'generic job starts with no dependency-state report';
+
+    dies-ok {
+        $job.record-dependency-state(%( status => 'ready', result => %( x => 1 ) ));
+    }, 'unknown report keys are rejected';
+    dies-ok {
+        $job.record-dependency-state(%(
+            status => 'ready',
+            prerequisite-id => 'dep',
+        ));
+    }, 'ready reports cannot carry prerequisite fields';
+    dies-ok {
+        $job.record-dependency-state(%(
+            status => 'blocked',
+            prerequisite-id => 'dep',
+            edge => 'depends-on',
+            required-state => 'done',
+        ));
+    }, 'non-ready reports require prerequisite-state';
+    dies-ok {
+        $job.record-dependency-state(%( status => 'waiting' ));
+    }, 'invalid status is rejected';
+    dies-ok {
+        $job.record-dependency-state(%(
+            status => 'blocked',
+            prerequisite-id => 'dep',
+            edge => 'before',
+            prerequisite-state => 'running',
+            required-state => 'done',
+        ));
+    }, 'invalid edge is rejected';
+    dies-ok {
+        $job.record-dependency-state(%(
+            status => 'blocked',
+            prerequisite-id => 'dep',
+            edge => 'depends-on',
+            prerequisite-state => 'running',
+            required-state => 'success',
+        ));
+    }, 'invalid required-state is rejected';
+    lives-ok {
+        $job.record-dependency-state(%(
+            status => 'blocked',
+            prerequisite-id => "dep\nid",
+            edge => 'depends-on',
+            prerequisite-state => 'running',
+            required-state => 'done',
+        ));
+    }, 'generic dependency ids retain their exact string contract';
+
+    lives-ok {
+        $job.record-dependency-state(%(
+            status => 'blocked', prerequisite-id => '', edge => 'after',
+            prerequisite-state => '', required-state => 'terminal',
+        ));
+    }, 'generic empty id and state strings remain exact metadata';
+    dies-ok {
+        $job.record-dependency-state(%(
+            status => 'blocked', prerequisite-id => 'dep', edge => 'after',
+            prerequisite-state => 'running', required-state => 'done',
+        ));
+    }, 'required terminal condition must agree with a soft edge';
+    dies-ok {
+        $job.record-dependency-state(%(
+            status => 'doomed', prerequisite-id => 'dep', edge => 'after',
+            prerequisite-state => 'error', required-state => 'terminal',
+        ));
+    }, 'a failed soft prerequisite does not doom its dependent';
+
+    my $long-id = 'dep-' ~ ('x' x 400);
+    my $custom-state = 'custom-terminal-' ~ ('z' x 160);
+    $job.record-dependency-state(%(
+        status => 'doomed',
+        prerequisite-id => $long-id,
+        edge => 'depends-on',
+        prerequisite-state => $custom-state,
+        required-state => 'done',
+    ));
+    is $job.dependency-state<prerequisite-id>, $long-id,
+        'generic dependency ids are not truncated or capped';
+    is $job.dependency-state<prerequisite-state>, $custom-state,
+        'custom terminal states are preserved exactly';
+
+    my $report = $job.dependency-state;
+    $report<status> = 'mutated';
+    is $job.dependency-state<status>, 'doomed',
+        'scalar-held report mutation does not alias internal state';
 };
 
 subtest 'keep-once settles bare promises without racing throws' => {

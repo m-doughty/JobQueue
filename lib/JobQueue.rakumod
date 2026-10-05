@@ -97,7 +97,14 @@ Hard edges (C<depends-on>) require their dependency to finish
 C<done>, and a failure cascades transitively as C<superseded>. Soft
 edges (C<after>) only wait for a terminal state and run regardless of
 the outcome. Each dependency's C<state> and C<result> land in the
-dependent's C<dep-results> at release.
+dependent's C<dep-results> at release. Completed predecessors may be
+pruned from live bookkeeping, but the coordinator keeps a bounded
+terminal-outcome cache so a dependent submitted shortly after pruning
+still sees the predecessor's C<state>, C<result> and C<dep-extras>.
+Every dependency resolution also records a compact
+C<dependency-state> report on the job: C<ready>, C<blocked> or
+C<doomed>, plus the first relevant prerequisite id, edge, observed
+state and required state for non-ready jobs.
 
 =head2 C<JobQueue::FailedRegistry> — retry with identical inputs
 
@@ -150,6 +157,18 @@ implementation exists to hold, each one paid for by a production bug.
   cancelled, or not-currently-running jobs are ignored, so a late note
   from a straggling worker can never resurrect a finished row.
 
+=item B<Pruned terminal dependency outcomes remain briefly
+  addressable.> The coordinator retains a bounded FIFO cache of
+  terminal C<dep-results> payloads, so asynchronous DAG extension can
+  attach a dependent after its predecessor Job object was pruned
+  without misclassifying that predecessor as unknown. The cache stores
+  the same top-level handoff Hash shape the dependent receives:
+  C<state>, C<result> and filtered C<dep-extras>. The coordinator
+  itself adds no Job object, Promise or Lock to that handoff; values
+  supplied by C<result> and C<dep-extras> keep their normal Raku
+  reference semantics. When the cache evicts, hard and soft edges use
+  the normal unknown-dependency rules.
+
 =item B<A misbehaving runner cannot stall the queue.> A runner
   returning a non-Promise is coerced to a kept one; a runner that
   throws has its exception message captured onto C<$job.error> and
@@ -158,6 +177,9 @@ implementation exists to hold, each one paid for by a production bug.
 =item B<C<live-count> and C<total-count> are different questions.>
   Lock a reply box on the former (what the user waits for); size a
   backend pool with the latter (what physically occupies it).
+  C<physical-job-ids> returns the atomic id snapshot behind the
+  physical view, including cancelled/superseded runners until their
+  drain actually ends.
 
 =head1 THE STORE SINK CONTRACT
 
@@ -180,10 +202,12 @@ $store.dispatch($event, queue => $queue-name, job => %snapshot);
 
 C<%snapshot> comes from C<JobQueue::Queue.job-snapshot>: plain scalars
 only — id, scope-id, state, timestamps, lane, priority, phase,
-C<error>, plus whatever your class's C<snapshot-extras> adds. It is
-safe to drop into a Redux-style store, serialise, or send over a
-socket. The full Job object is not: it holds Promises, closures and a
-Lock.
+C<error>, the coordinator's compact C<dependency-state> report when
+present, plus whatever your class's C<snapshot-extras> adds.
+C<dependency-state> is queue-owned, so C<snapshot-extras> cannot
+override it. It is safe to drop into a Redux-style store, serialise,
+or send over a socket. The full Job object is not: it holds Promises,
+closures and a Lock.
 
 C<$.store> is untyped so any object answering C<dispatch> works.
 C<JobQueue::EventSink> names the contract if you want the

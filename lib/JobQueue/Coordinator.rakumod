@@ -68,6 +68,17 @@ else comes from the dependency's C<dep-extras>. The handoff is
 in-memory by design — routing it through a shared store slot would
 race concurrent submissions and leak stale results between them.
 
+The coordinator may prune completed Job objects once they have no
+live dependents, but it retains a bounded terminal outcome cache
+(C<terminal-outcome-limit>, default 1024). This lets asynchronous
+code submit a dependent just after its predecessor was pruned without
+turning a known completion into an unknown dependency. Retained
+entries contain only C<state>, C<result> and filtered C<dep-extras>,
+and copy the top-level handoff Hash before release. The coordinator
+does not add the predecessor Job object, Promise or Lock to that
+handoff; caller-supplied C<result> and C<dep-extras> values keep
+their normal Raku reference semantics.
+
 =head2 Failure propagation
 
 A hard dependency terminating in anything but C<done> B<supersedes>
@@ -83,7 +94,8 @@ Unknown hard dependency ids (never submitted here) supersede the
 dependent immediately with a logged error — fail-fast beats a job
 silently held forever. Unknown B<soft> deps are skipped: a
 best-effort edge to something that never existed is satisfied by
-definition.
+definition. A dependency whose outcome aged out of
+C<terminal-outcome-limit> follows the same unknown rules.
 
 =head2 Held-job watchdog
 
@@ -121,9 +133,19 @@ has $.log = NullLog.new;
     silently forever. )
 has Num $.held-warn-after = 300e0;
 
+#|( Number of terminal dependency outcomes retained after coordinator
+    bookkeeping prunes the Job object. This covers asynchronous DAG
+    extension: a dependent submitted just after its predecessor was
+    pruned still sees the predecessor's bounded handoff. Set
+    to 0 to restore strict live-job-only dependency lookup. )
+has UInt $.terminal-outcome-limit = 1024;
+
 has %!queues;               # name => queue
 has %!jobs;                 # job-id => { job, queue-name, held(Bool), held-at }
 has %!dependents;           # dep-id => [dependent job-ids] (hard + soft)
+has %!terminal-outcomes;     # job-id => { state, result, ...dep-extras }
+has @!terminal-outcome-order;
+has %!dep-handoffs;          # job-id => dep-id => accepted terminal outcome
 has %!warned-held;          # job-id => True once the held warning fired
 has Lock $!lock = Lock.new;
 
@@ -178,12 +200,18 @@ method submit(Str:D $queue-name, Job:D $job) {
         %!jobs{$job.id} = %( :$job, :queue-name($queue-name), :held(False),
             held-at => Instant );
         for flat $job.depends-on, $job.after -> $dep-id {
+            my $dep = (%!jobs{$dep-id} // {})<job>;
+            next unless $dep.defined && $dep.completion.status !~~ Kept;
             %!dependents{$dep-id} //= [];
             %!dependents{$dep-id}.push: $job.id;
         }
     }
 
-    given self!dep-status($job) {
+    my %resolution = self!resolve-dependencies($job);
+    $job.record-dependency-state(%resolution<report>);
+    self!pin-handoffs($job.id, %resolution<handoffs>);
+
+    given %resolution<status> {
         when 'ready' {
             self!release($job, $queue);
         }
@@ -209,7 +237,10 @@ method tick(--> Nil) {
             .map(*<job>).List;
     };
     for @held -> $job {
-        given self!dep-status($job) {
+        my %resolution = self!resolve-dependencies($job);
+        $job.record-dependency-state(%resolution<report>);
+        self!pin-handoffs($job.id, %resolution<handoffs>);
+        given %resolution<status> {
             when 'ready' {
                 $!lock.protect: { %!jobs{$job.id}<held> = False with %!jobs{$job.id} };
                 self!release($job, self.queue($job.queue-name));
@@ -234,14 +265,32 @@ method tick(--> Nil) {
 
     .tick for $!lock.protect({ %!queues.values.List });
 
-    # Prune: terminal jobs with no live dependents. Materialize the
-    # candidate list BEFORE deleting — a lazy grep over .keys while
-    # the hash shrinks is the classic mutation-under-iteration trap.
+    # Retain terminal outcomes before pruning Job objects. The cache
+    # is bounded and stores dependency handoff Hashes, so a late
+    # async dependent can still resolve a predecessor without retaining
+    # completed Job objects except for references the caller put in
+    # result or dep-extras.
+    my @terminal-jobs = $!lock.protect: {
+        %!jobs.values.grep({
+            $_<job>.completion.status ~~ Kept
+        }).map(*<job>).List;
+    };
+    my %terminal-outcomes = @terminal-jobs.map({
+        .id => self!terminal-outcome-for-job($_)
+    });
+
+    # Prune only the exact terminal jobs whose outcomes were just
+    # captured. A job that becomes terminal while outcomes are being
+    # harvested waits for the next tick, rather than being deleted
+    # without a retained handoff.
     $!lock.protect: {
-        my @terminal-ids = %!jobs.keys.grep({
-            %!jobs{$_}<job>.completion.status ~~ Kept
-        }).List;
-        for @terminal-ids -> $id {
+        for @terminal-jobs -> $terminal-job {
+            my $id = $terminal-job.id;
+            my $entry = %!jobs{$id};
+            next unless $entry.defined
+                && $terminal-job.completion.status ~~ Kept;
+            self!remember-terminal-outcome-locked($id,
+                %terminal-outcomes{$id});
             my Bool $has-live-dependent = so (%!dependents{$id} // []).first(
                 -> $did {
                     my $e = %!jobs{$did};
@@ -250,6 +299,7 @@ method tick(--> Nil) {
             unless $has-live-dependent {
                 %!jobs{$id}:delete;
                 %!dependents{$id}:delete;
+                %!dep-handoffs{$id}:delete;
                 %!warned-held{$id}:delete;
             }
         }
@@ -383,39 +433,188 @@ method active-count(Str:D $kind --> Int) {
 #| Keys of a dep-results entry that the coordinator owns outright.
 my constant RESERVED-DEP-KEYS = Set.new(<state result>);
 
-#| 'ready' | 'blocked' | 'doomed'
-method !dep-status(Job:D $job --> Str) {
+#| 'ready' | 'blocked' | 'doomed', plus accepted terminal handoffs.
+method !resolve-dependencies(Job:D $job --> Hash) {
+    my %handoffs = self!pinned-handoffs($job.id);
+    my %first-blocker;
     for $job.depends-on -> $dep-id {
-        my $dep = $!lock.protect({ (%!jobs{$dep-id} // {})<job> });
-        without $dep {
+        my %dep = self!dependency-status($job.id, $dep-id);
+        unless %dep<known> {
             $.log.error('coordinator/unknown-dependency',
                 job-id => $job.id, dep-id => $dep-id);
-            return 'doomed';
+            return %(
+                status   => 'doomed',
+                handoffs => %handoffs,
+                report   => self!dependency-report(
+                    'doomed',
+                    dep-id => $dep-id,
+                    edge => 'depends-on',
+                    observed-state => 'unknown',
+                    required-state => 'done',
+                ),
+            );
         }
-        return 'blocked' unless $dep.completion.status ~~ Kept;
-        return 'doomed' unless $dep.state eq 'done';
+        unless %dep<terminal> {
+            %first-blocker = self!dependency-report(
+                'blocked',
+                dep-id => $dep-id,
+                edge => 'depends-on',
+                observed-state => %dep<state>,
+                required-state => 'done',
+            ) unless %first-blocker;
+            next;
+        }
+        %handoffs{$dep-id} = %dep<outcome>.Hash;
+        unless %dep<outcome><state> eq 'done' {
+            return %(
+                status   => 'doomed',
+                handoffs => %handoffs,
+                report   => self!dependency-report(
+                    'doomed',
+                    dep-id => $dep-id,
+                    edge => 'depends-on',
+                    observed-state => %dep<outcome><state>,
+                    required-state => 'done',
+                ),
+            );
+        }
     }
     for $job.after -> $dep-id {
-        my $dep = $!lock.protect({ (%!jobs{$dep-id} // {})<job> });
+        my %dep = self!dependency-status($job.id, $dep-id);
         # Unknown soft dep: run anyway — soft edges are best-effort.
-        next without $dep;
-        return 'blocked' unless $dep.completion.status ~~ Kept;
+        next unless %dep<known>;
+        unless %dep<terminal> {
+            %first-blocker = self!dependency-report(
+                'blocked',
+                dep-id => $dep-id,
+                edge => 'after',
+                observed-state => %dep<state>,
+                required-state => 'terminal',
+            ) unless %first-blocker;
+            next;
+        }
+        %handoffs{$dep-id} = %dep<outcome>.Hash;
     }
-    'ready';
+    %first-blocker
+        ?? %( status => 'blocked', handoffs => %handoffs, report => %first-blocker )
+        !! %( status => 'ready', handoffs => %handoffs,
+              report => self!dependency-report('ready') );
 }
 
 method !release(Job:D $job, $queue --> Nil) {
+    my %handoffs = self!pinned-handoffs($job.id);
     for flat $job.depends-on, $job.after -> $dep-id {
-        my $dep = $!lock.protect({ (%!jobs{$dep-id} // {})<job> });
-        next without $dep;
-        my %r = state => $dep.state, result => $dep.result;
-        my %extras = $dep.dep-extras;
-        for %extras.kv -> $k, $v {
-            %r{$k} = $v unless RESERVED-DEP-KEYS{$k};
-        }
-        $job.dep-results{$dep-id} = %r;
+        next unless %handoffs{$dep-id}:exists;
+        $job.dep-results{$dep-id} = %handoffs{$dep-id}.Hash;
     }
+    $!lock.protect: { %!dep-handoffs{$job.id}:delete };
     $queue.enqueue($job);
+}
+
+method !dependency-status(Str:D $job-id, Str:D $dep-id --> Hash) {
+    my %pinned = $!lock.protect: {
+        my $for-job = %!dep-handoffs{$job-id};
+        if $for-job.defined && ($for-job{$dep-id}:exists) {
+            $for-job{$dep-id}.Hash;
+        } else {
+            {};
+        }
+    };
+    return %(
+        known    => True,
+        terminal => True,
+        outcome  => %pinned.Hash,
+    ) if %pinned;
+
+    my $dep = $!lock.protect({ (%!jobs{$dep-id} // {})<job> });
+    with $dep {
+        my %observation = .dependency-observation;
+        return %(
+            known    => True,
+            terminal => False,
+            state    => %observation<state>,
+        )
+            unless %observation<terminal>;
+        return %(
+            known    => True,
+            terminal => True,
+            outcome  => self!terminal-outcome-for-job($_),
+        );
+    }
+    my %outcome = $!lock.protect({ (%!terminal-outcomes{$dep-id} // {}).Hash });
+    return %(
+        known    => True,
+        terminal => True,
+        outcome  => %outcome,
+    ) if %outcome;
+    %( known => False, terminal => False );
+}
+
+method !dependency-report(
+    Str:D $status,
+    Str :$dep-id,
+    Str :$edge,
+    Str :$observed-state,
+    Str :$required-state,
+    --> Hash
+) {
+    return %( status => 'ready' ) if $status eq 'ready';
+    %(
+        status             => $status,
+        prerequisite-id    => $dep-id,
+        edge               => $edge,
+        prerequisite-state => $observed-state,
+        required-state     => $required-state,
+    );
+}
+
+method !pinned-handoffs(Str:D $job-id --> Hash) {
+    my %pinned = $!lock.protect({ (%!dep-handoffs{$job-id} // {}).Hash });
+    my %copy;
+    for %pinned.kv -> $dep-id, %outcome {
+        %copy{$dep-id} = %outcome.Hash;
+    }
+    %copy;
+}
+
+method !pin-handoffs(Str:D $job-id, %handoffs --> Nil) {
+    return unless %handoffs;
+    $!lock.protect: {
+        %!dep-handoffs{$job-id} //= {};
+        for %handoffs.kv -> $dep-id, %outcome {
+            %!dep-handoffs{$job-id}{$dep-id} = %outcome.Hash;
+        }
+    }
+}
+
+method !terminal-outcome-for-job(Job:D $job --> Hash) {
+    my %observation = $job.dependency-observation;
+    my %outcome = state => %observation<state>, result => $job.result;
+    my %extras = $job.dep-extras;
+    for %extras.kv -> $k, $v {
+        %outcome{$k} = $v unless RESERVED-DEP-KEYS{$k};
+    }
+    %outcome;
+}
+
+method !remember-terminal-outcome(Job:D $job --> Nil) {
+    return unless $job.completion.status ~~ Kept;
+    return if $!terminal-outcome-limit == 0;
+    my %outcome = self!terminal-outcome-for-job($job);
+    $!lock.protect: {
+        self!remember-terminal-outcome-locked($job.id, %outcome);
+    }
+}
+
+method !remember-terminal-outcome-locked(Str:D $job-id, %outcome --> Nil) {
+    return if $!terminal-outcome-limit == 0;
+    return if %!terminal-outcomes{$job-id}:exists;
+    %!terminal-outcomes{$job-id} = %outcome.Hash;
+    @!terminal-outcome-order.push: $job-id;
+    while @!terminal-outcome-order.elems > $!terminal-outcome-limit {
+        my $old-id = @!terminal-outcome-order.shift;
+        %!terminal-outcomes{$old-id}:delete;
+    }
 }
 
 method !dispatch-waiting(Job:D $job, $queue --> Nil) {
@@ -430,6 +629,8 @@ method !supersede-held(Job:D $job, Str :$reason! --> Bool) {
     $job.request-cancel;
     my Bool $won = $job.finish('superseded', :by<cancel>);
     if $won {
+        self!remember-terminal-outcome($job);
+        $!lock.protect: { %!dep-handoffs{$job.id}:delete };
         $.log.info('coordinator/job-superseded-held',
             job-id => $job.id, kind => ($job.?kind // ''), :$reason);
         with $.store {
@@ -459,6 +660,11 @@ method !cascade-supersede(Str:D $job-id, Str :$reason! --> Nil) {
         # Soft (after) dependents run regardless of the dep's fate.
         next unless $job-id ∈ $dep-job.depends-on;
         if %entry<held> {
+            # An explicit invalidation can cascade from an already successful
+            # parent. Report the actual prerequisite decision rather than
+            # inventing a failed outcome for that immutable successful result.
+            my %resolution = self!resolve-dependencies($dep-job);
+            $dep-job.record-dependency-state(%resolution<report>);
             $!lock.protect: { %!jobs{$did}<held> = False with %!jobs{$did} };
             self!supersede-held($dep-job, :$reason);
         } else {

@@ -237,6 +237,7 @@ has Lock $!lock = Lock.new;
 my constant RESERVED-SNAPSHOT-KEYS = Set.new(<
     id job-id kind scope-id state enqueued-at started-at finished-at
     error phase cancellable lane dedup-key priority queue-name
+    dependency-state
 >);
 
 #|( Add a job to the queue. If we're in parallel mode (or the
@@ -323,6 +324,8 @@ method job-snapshot(Job:D $job --> Hash) {
     %s<lane>        = $job.lane       if ($job.lane       // '').chars;
     %s<dedup-key>   = $job.dedup-key  if ($job.dedup-key  // '').chars;
     %s<queue-name>  = $job.queue-name if ($job.queue-name // '').chars;
+    my %dependency-state = $job.dependency-state;
+    %s<dependency-state> = %dependency-state if %dependency-state;
     my %extras = $job.snapshot-extras;
     for %extras.kv -> $k, $v {
         %s{$k} = $v unless RESERVED-SNAPSHOT-KEYS{$k};
@@ -666,6 +669,17 @@ method pending-count(--> Int) {
 #| All jobs combined (running + pending). For diagnostics + tests.
 method total-count(--> Int) {
     $!lock.protect: { %!running.elems + @!pending.elems }
+}
+
+#|( Atomic physical snapshot of pending + running job ids. Running
+    includes cancelled/superseded jobs until the runner's then-hook
+    removes them, so callers can wait for true backend drain. )
+method physical-job-ids(--> Array) {
+    $!lock.protect: {
+        my @ids = %!running.keys.List;
+        @ids.append: @!pending.map(*.id).List;
+        @ids.Array;
+    }
 }
 
 #|( Jobs that still represent LIVE work: pending + running whose
