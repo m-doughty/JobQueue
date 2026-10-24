@@ -2,6 +2,18 @@ Revision history for JobQueue
 
 {{$NEXT}}
 
+0.1.3  2026-10-24T19:48:18+01:00
+    - [2026-10-24] Fix a data race in JobQueue::Coordinator: tick,
+      find-jobs and active-count handed back a lazy sequence from inside
+      the lock, so the walk over the job table ran after the lock was
+      released while submit inserted into it and tick pruned from it,
+      which could end a run with a MoarVM "stale hashtable pointer" crash.
+      The walks, the queue-registry walks (tick, cancel, find-job,
+      cancel-most-recent-in-scope, total-active) and the per-job
+      bookkeeping and dependency-handoff copies now complete inside the
+      critical section, so callers always get a snapshot. The held-too-long
+      warning is now tested and set under the lock as well.
+
 0.1.2  2026-10-05T10:53:36+01:00
     - Retain a bounded FIFO cache of terminal dependency outcomes in
       JobQueue::Coordinator. Late hard/soft dependents submitted after

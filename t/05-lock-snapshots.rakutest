@@ -1,0 +1,323 @@
+use Test;
+use lib 'lib';
+
+use JobQueue::Job;
+use JobQueue::Queue;
+use JobQueue::Coordinator;
+
+# What a Coordinator reader takes out of its lock is a SNAPSHOT: built
+# inside the critical section, and owing nothing to the guarded tables
+# once the lock is released.
+#
+# The trap this file pins is Raku's, not ours. `.List` on a Seq does not
+# force it -- the List fills itself in as it is read -- so
+#
+#     $lock.protect: { %!jobs.values.grep({ … }).map(*<job>).List }
+#
+# returns before the grep has run, and the grep body then walks the
+# guarded hash with the lock already released, while submit inserts into
+# it and tick deletes from it. Under load that is a data race on a MoarVM
+# hash ("stale hashtable pointer"). `.Hash` on a Hash is no better: it is
+# the Hash itself, so a copy "taken" after the lock is released is a read
+# of the live table.
+#
+# A race cannot be tested by hoping to lose it, so these subtests test
+# the PROPERTY the race violates, deterministically, in two ways:
+#
+#   * Queues: the Coordinator calls out to each registered queue OUTSIDE
+#     its lock, on purpose. The first queue visited registers dozens more
+#     (forcing the hash to grow) and every visit is recorded. A snapshot
+#     visits exactly the queues there were; a lazy walk of the live hash
+#     visits whatever the growing table shows it, or dies.
+#
+#   * Jobs: the job tables are walked by a predicate on each job's
+#     completion Promise. That Promise spies on the first `.status` read,
+#     and from the hook asks ANOTHER thread to take the Coordinator lock.
+#     If the walk is inside the critical section the other thread cannot
+#     get in until the hook returns, so it is still waiting after the
+#     bounded wait; if the walk escaped the lock it gets in at once. Only
+#     the blocked outcome is waited for, so a passing run is never
+#     racing anything.
+
+plan 11;
+
+class TestJob does Job {
+	has Str $.kind = 'test';
+}
+
+#|( A completion Promise that runs C<on-status> (once) the first time its
+    status is read. )
+class SpyPromise is Promise {
+	has $.on-status is rw;
+
+	method status(--> PromiseStatus) {
+		with $!on-status {
+			my &hook = $_;
+			$!on-status = Nil;
+			hook();
+		}
+		callsame;
+	}
+}
+
+class RecordingLog {
+	has @.errors;
+
+	method debug(Str:D $verb, *%fields --> Nil) { }
+	method info(Str:D $verb, *%fields --> Nil) { }
+	method error(Str:D $verb, *%fields --> Nil) { @!errors.push: $verb }
+}
+
+class SpyQueue {
+	has Str $.name is required;
+	has @.seen;
+	has &.on-visit;
+
+	method !visit(--> Nil) {
+		@!seen.push: $!name;
+		&!on-visit($!name) if &!on-visit.defined;
+	}
+
+	method tick(--> Nil) { self!visit }
+	method find-job(Str:D $job-id) { self!visit; Nil }
+	method cancel(Str:D $job-id, *%opts --> Bool) { self!visit; False }
+	method cancel-most-recent-in-scope($scope, *%opts --> Bool) { self!visit; False }
+	method live-count(--> Int) { self!visit; 0 }
+}
+
+sub wait-for(&cond, Num :$timeout = 5e0) {
+	my $t0 = now;
+	until &cond() || now - $t0 > $timeout {
+		await Promise.in(0.02);
+	}
+}
+
+sub make-queue(Str $name, %gates) {
+	JobQueue::Queue.new(
+		:$name,
+		is-parallel-now => -> { True },
+		run-job         => -> $job {
+			%gates{$job.id} = my $g = Promise.new;
+			start { (await $g) // 'done' }
+		},
+	);
+}
+
+sub spy-job(*%extra) {
+	TestJob.new(scope-id => 1, completion => SpyPromise.new, |%extra);
+}
+
+# Make the job's completion Promise ask another thread for the
+# Coordinator lock the first time it is read, and note whether that
+# thread got in.
+sub arm($coord, $job, @verdicts, @probes --> Nil) {
+	$job.completion.on-status = -> {
+		my $probe = start { $coord.queue('no-such-queue') };
+		await Promise.anyof($probe, Promise.in(0.3));
+		@verdicts.push: $probe.status ~~ Kept;
+		@probes.push: $probe;
+	};
+}
+
+# A coordinator holding one RUNNING job `$dep` (so that anything depending
+# on it stays held) in a real queue.
+sub make-coord(%gates, *%opts) {
+	my $coord = JobQueue::Coordinator.new(|%opts);
+	$coord.register-queue('q-a', make-queue('q-a', %gates));
+	$coord;
+}
+
+sub finish-running(%gates, $job, $coord --> Nil) {
+	wait-for(-> { %gates{$job.id}:exists });
+	%gates{$job.id}.keep('done');
+	await $job.completion;
+	wait-for(-> { $coord.queue('q-a').total-count == 0 });
+}
+
+# --- jobs: the walks happen under the lock ----------------------------------
+
+subtest 'find-jobs walks the job table inside the lock' => {
+	plan 3;
+	my %gates;
+	my $coord = make-coord(%gates);
+	my $dep = $coord.submit('q-a', TestJob.new(scope-id => 1));
+	my $held = $coord.submit('q-a', spy-job(depends-on => [$dep.id]));
+	my (@verdicts, @probes);
+	arm($coord, $held, @verdicts, @probes);
+
+	my @found = $coord.find-jobs;
+	is @verdicts.elems, 1, 'the walk read the held job\'s completion once';
+	nok @verdicts[0], 'while the lock was still held (a second thread was kept out)';
+	is-deeply @found.map(*.id).sort.List, ($dep.id, $held.id).sort.List,
+		'and both live jobs were found';
+
+	await @probes;
+	%gates{$dep.id}.keep('done');
+	await $dep.completion;
+};
+
+subtest 'active-count walks the job table inside the lock' => {
+	plan 3;
+	my %gates;
+	my $coord = make-coord(%gates);
+	my $dep = $coord.submit('q-a', TestJob.new(scope-id => 1));
+	my $held = $coord.submit('q-a', spy-job(depends-on => [$dep.id]));
+	my (@verdicts, @probes);
+	arm($coord, $held, @verdicts, @probes);
+
+	is $coord.active-count('test'), 2, 'both live jobs are counted';
+	is @verdicts.elems, 1, 'the walk read the held job\'s completion once';
+	nok @verdicts[0], 'while the lock was still held';
+
+	await @probes;
+	%gates{$dep.id}.keep('done');
+	await $dep.completion;
+};
+
+subtest 'total-active counts held jobs inside the lock' => {
+	plan 3;
+	my %gates;
+	my $coord = make-coord(%gates);
+	my $dep = $coord.submit('q-a', TestJob.new(scope-id => 1));
+	my $held = $coord.submit('q-a', spy-job(depends-on => [$dep.id]));
+	my (@verdicts, @probes);
+	arm($coord, $held, @verdicts, @probes);
+
+	is $coord.total-active, 2, 'the held job and the running job are active';
+	is @verdicts.elems, 1, 'the count read the held job\'s completion once';
+	nok @verdicts[0], 'while the lock was still held';
+
+	await @probes;
+	%gates{$dep.id}.keep('done');
+	await $dep.completion;
+};
+
+subtest 'tick picks the held jobs inside the lock' => {
+	plan 3;
+	my %gates;
+	my $coord = make-coord(%gates);
+	my $dep = $coord.submit('q-a', TestJob.new(scope-id => 1));
+	my $held = $coord.submit('q-a', spy-job(depends-on => [$dep.id]));
+	my (@verdicts, @probes);
+	arm($coord, $held, @verdicts, @probes);
+
+	$coord.tick;
+	is @verdicts.elems, 1, 'the first read of the held job\'s completion happened once';
+	nok @verdicts[0], 'while the lock was still held';
+	is $held.state, 'pending', 'and the job is still held, its dependency unfinished';
+
+	await @probes;
+	%gates{$dep.id}.keep('done');
+	await $dep.completion;
+};
+
+subtest 'tick picks the terminal jobs inside the lock' => {
+	plan 3;
+	my %gates;
+	my $coord = make-coord(%gates);
+	my $job = $coord.submit('q-a', spy-job());
+	finish-running(%gates, $job, $coord);
+	my (@verdicts, @probes);
+	arm($coord, $job, @verdicts, @probes);
+
+	$coord.tick;
+	is @verdicts.elems, 1, 'the first read of the terminal job\'s completion happened once';
+	nok @verdicts[0], 'while the lock was still held';
+	nok $coord.find-job($job.id).defined, 'and the terminal job was pruned';
+
+	await @probes;
+};
+
+subtest 'the held-too-long warning fires once, however often tick runs' => {
+	plan 3;
+	my $log = RecordingLog.new;
+	my %gates;
+	my $coord = make-coord(%gates, :$log, held-warn-after => 0e0);
+	my $dep = $coord.submit('q-a', TestJob.new(scope-id => 1));
+	my $held = $coord.submit('q-a', TestJob.new(scope-id => 1, depends-on => [$dep.id]));
+
+	$coord.tick for ^3;
+	is $log.errors.elems, 1, 'three ticks, one warning';
+	is $log.errors[0], 'coordinator/job-held-too-long', 'and it is the watchdog';
+
+	%gates{$dep.id}.keep('done');
+	await $dep.completion;
+	$coord.tick;
+	wait-for(-> { %gates{$held.id}:exists });
+	ok %gates{$held.id}:exists, 'the dependent still released normally';
+	%gates{$held.id}.keep('done');
+	await $held.completion;
+};
+
+# --- queues: the registry is walked as a snapshot ---------------------------
+
+# Three queues, the first of which, when visited, registers forty more.
+# Answers the coordinator and the visits recorded.
+sub spy-registry(--> Hash) {
+	my $coord = JobQueue::Coordinator.new;
+	my @seen;
+	my @added;
+	my Bool $grown = False;
+	my &record = -> Str:D $name {
+		@seen.push: $name;
+		unless $grown {
+			$grown = True;
+			for ^40 -> $i {
+				$coord.register-queue("late-$i",
+					SpyQueue.new(name => "late-$i", on-visit => &record));
+				@added.push: $i;
+			}
+		}
+	};
+	for <a b c> -> $name {
+		$coord.register-queue($name, SpyQueue.new(:$name, on-visit => &record));
+	}
+	%( :$coord, :@seen, :@added );
+}
+
+sub only-the-original-three(%registry, Str:D $what --> Nil) {
+	is %registry<added>.elems, 40,
+		"$what: the first visit really did register forty more queues";
+	is-deeply %registry<seen>.sort.List, <a b c>,
+		"$what: and the walk still visited exactly the three queues there were, once each";
+}
+
+subtest 'tick ticks a snapshot of the queues' => {
+	plan 2;
+	my %registry = spy-registry();
+	my $coord = %registry<coord>;
+	$coord.tick;
+	only-the-original-three(%registry, 'tick');
+};
+
+subtest 'cancel of an unknown id searches a snapshot of the queues' => {
+	plan 3;
+	my %registry = spy-registry();
+	my $coord = %registry<coord>;
+	nok $coord.cancel('no-such-job'), 'nothing to cancel';
+	only-the-original-three(%registry, 'cancel');
+};
+
+subtest 'find-job searches a snapshot of the queues' => {
+	plan 3;
+	my %registry = spy-registry();
+	my $coord = %registry<coord>;
+	nok $coord.find-job('no-such-job').defined, 'nothing found';
+	only-the-original-three(%registry, 'find-job');
+};
+
+subtest 'cancel-most-recent-in-scope asks a snapshot of the queues' => {
+	plan 3;
+	my %registry = spy-registry();
+	my $coord = %registry<coord>;
+	nok $coord.cancel-most-recent-in-scope(1), 'nothing to cancel';
+	only-the-original-three(%registry, 'cancel-most-recent-in-scope');
+};
+
+subtest 'total-active counts a snapshot of the queues' => {
+	plan 3;
+	my %registry = spy-registry();
+	my $coord = %registry<coord>;
+	is $coord.total-active, 0, 'nothing is live';
+	only-the-original-three(%registry, 'total-active');
+};

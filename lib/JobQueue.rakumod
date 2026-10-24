@@ -315,11 +315,11 @@ module JobQueue { }
     `use` statements above; only Job and keep-once are lexical exports
     that need forwarding. )
 sub EXPORT(|) {
-    Map.new(
-        'Job'        => JobQueue::Job::Job,
-        '&keep-once' => &keep-once,
-        'NullLog'    => JobQueue::Observability::NullLog,
-        'NullSpan'   => JobQueue::Observability::NullSpan,
-        'NullTracer' => JobQueue::Observability::NullTracer,
-    )
+	Map.new(
+		'Job'        => JobQueue::Job::Job,
+		'&keep-once' => &keep-once,
+		'NullLog'    => JobQueue::Observability::NullLog,
+		'NullSpan'   => JobQueue::Observability::NullSpan,
+		'NullTracer' => JobQueue::Observability::NullTracer,
+	)
 }

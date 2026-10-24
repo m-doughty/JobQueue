@@ -204,45 +204,45 @@ unit module JobQueue::Job;
     say $p.result;                 # first
     =end code )
 our sub keep-once($promise, $value --> Bool) is export {
-    return False without $promise;
-    so (try { $promise.keep($value); True });
+	return False without $promise;
+	so (try { $promise.keep($value); True });
 }
 
 role Job is export {
-    has Str     $.id            = ~uuid-v4;
+	has Str     $.id            = ~uuid-v4;
 
     #|( Logical owner of the work — conversation id, document slug,
         tenant uuid, whatever your domain uses. Deliberately untyped:
         the queue and coordinator only ever compare scopes with
         C<eqv>, so Int and Str scopes both work (and can coexist). )
-    has         $.scope-id is required;
+	has         $.scope-id is required;
 
-    has Str     $.state is rw   = 'pending';
-    has Promise $.cancel-token  = Promise.new;
-    has Promise $.completion    = Promise.new;
-    has Instant $.enqueued-at   = now;
-    has Instant $.started-at  is rw;
-    has Instant $.finished-at is rw;
+	has Str     $.state is rw   = 'pending';
+	has Promise $.cancel-token  = Promise.new;
+	has Promise $.completion    = Promise.new;
+	has Instant $.enqueued-at   = now;
+	has Instant $.started-at  is rw;
+	has Instant $.finished-at is rw;
 
     #|( Human-readable failure reason, set by the runner before it
         finishes the job with a failure state. Empty on success and
         cancellation. Carried into queue store events by
         C<JobQueue::Queue.job-snapshot> so failed jobs surface their
         cause in whatever UI renders the ledger. )
-    has Str     $.error is rw   = '';
+	has Str     $.error is rw   = '';
 
     #|( Live-job identity. When non-empty,
         C<JobQueue::Queue.enqueue> returns an existing pending/running
         job carrying the same key instead of enqueueing a duplicate
         (see the queue's dedup contract). Empty string disables
         dedup. )
-    has Str     $.dedup-key     = '';
+	has Str     $.dedup-key     = '';
 
     #|( Serialization lane. Jobs sharing a non-empty lane run at most
         one at a time (FIFO within the lane) even when the queue is
         in parallel mode; jobs in other lanes may overtake. Empty
         string = no lane constraint. )
-    has Str     $.lane          = '';
+	has Str     $.lane          = '';
 
     #|( Dispatch priority. When a queue slot frees, the highest
         priority among lane-eligible PENDING jobs starts first; FIFO
@@ -250,61 +250,61 @@ role Job is export {
         pipeline-critical jobs that must never sit behind long bulk
         work — keep bulk at 0, so starvation requires a continuous
         stream of prioritised jobs. )
-    has Int     $.priority      = 0;
+	has Int     $.priority      = 0;
 
     #|( Hard dependencies (job ids). C<JobQueue::Coordinator> holds
         this job until every hard dep completes 'done'; a hard dep
         failing / being cancelled / superseded supersedes this job
         transitively. Opaque to the queue itself. )
-    has Str     @.depends-on;
+	has Str     @.depends-on;
 
     #|( Soft dependencies (job ids): wait until the dep reaches ANY
         terminal state, then run regardless of its outcome. Used for
         best-effort precursors whose failure must not kill the
         dependent. )
-    has Str     @.after;
+	has Str     @.after;
 
     #| Name of the queue the coordinator submitted this job to.
-    has Str     $.queue-name is rw = '';
+	has Str     $.queue-name is rw = '';
 
     #|( Current phase string ('' = none), maintained via
         C<JobQueue::Queue.note-phase> and carried into job snapshots
         so a ledger can show pipeline stages. )
-    has Str     $.phase is rw   = '';
+	has Str     $.phase is rw   = '';
 
     #|( Whether a UI may offer to cancel this job. Jobs whose work has
         no abort surface can still be cancelled logically (the result
         is discarded at apply time), so this defaults True; set False
         only when cancellation would be a pure lie. )
-    has Bool    $.cancellable   = True;
+	has Bool    $.cancellable   = True;
 
     #|( Runner-written outcome payload. Injected into dependents'
         C<dep-results> by the coordinator when this job completes. )
-    has %.result is rw;
+	has %.result is rw;
 
     #|( dep-id => { state, result, ...dep-extras } for every declared
         dependency, injected by the coordinator at release time — the
         DAG's data handoff. )
-    has %.dep-results is rw;
+	has %.dep-results is rw;
 
-    # Last coordinator dependency-readiness report. It is kept after
-    # terminal completion so observers can still explain why a held
-    # job released, blocked, or was superseded.
-    has %!dependency-state;
+	# Last coordinator dependency-readiness report. It is kept after
+	# terminal completion so observers can still explain why a held
+	# job released, blocked, or was superseded.
+	has %!dependency-state;
 
-    has Lock $!dependency-state-lock = Lock.new;
+	has Lock $!dependency-state-lock = Lock.new;
 
-    # One lock guards both terminal transitions. finish/request-cancel
-    # race from the queue then-hook, cancel paths, and runners; the
-    # boolean return tells the caller whether IT performed the
-    # transition and therefore owns the terminal event emission.
-    has Lock $!terminal-lock = Lock.new;
+	# One lock guards both terminal transitions. finish/request-cancel
+	# race from the queue then-hook, cancel paths, and runners; the
+	# boolean return tells the caller whether IT performed the
+	# transition and therefore owns the terminal event emission.
+	has Lock $!terminal-lock = Lock.new;
 
     #|( True iff C<cancel-token> has been kept. Cheap, repeatable
         check used by runners at every guard point. )
-    method cancelled(--> Bool) {
-        $!cancel-token.status ~~ Kept;
-    }
+	method cancelled(--> Bool) {
+		$!cancel-token.status ~~ Kept;
+	}
 
     #|( Which side performed the terminal transition: 'runner' (the
         default — runner self-finish or the queue then-hook) or
@@ -314,7 +314,7 @@ role Job is export {
         value), so a cancel racing a runner self-finish can neither
         mislabel nor double-emit. Written atomically inside the
         winning C<finish> transition. )
-    has Str $.finished-by is rw = '';
+	has Str $.finished-by is rw = '';
 
     #|( Drive the job to a terminal state. ATOMIC and idempotent:
         returns True iff THIS call performed the transition. The kept
@@ -322,26 +322,26 @@ role Job is export {
         wins) is what the queue's then-hook routes the single
         terminal event on — C<$.state> is best-effort display state,
         not the emission key. )
-    method finish(Str:D $final-state, Str :$by = 'runner' --> Bool) {
-        $!terminal-lock.protect: {
-            return False if $!completion.status ~~ Kept;
-            $!state = $final-state;
-            $!finished-at = now;
-            $!finished-by = $by;
-            $!completion.keep($final-state);
-            True;
-        }
-    }
+	method finish(Str:D $final-state, Str :$by = 'runner' --> Bool) {
+		$!terminal-lock.protect: {
+			return False if $!completion.status ~~ Kept;
+			$!state = $final-state;
+			$!finished-at = now;
+			$!finished-by = $by;
+			$!completion.keep($final-state);
+			True;
+		}
+	}
 
     #|( Atomically keep the cancel token. True iff this call newly
         requested cancellation. )
-    method request-cancel(--> Bool) {
-        $!terminal-lock.protect: {
-            return False if $!cancel-token.status ~~ Kept;
-            $!cancel-token.keep('cancelled');
-            True;
-        }
-    }
+	method request-cancel(--> Bool) {
+		$!terminal-lock.protect: {
+			return False if $!cancel-token.status ~~ Kept;
+			$!cancel-token.keep('cancelled');
+			True;
+		}
+	}
 
     #|( Mark the job running (state + started-at), atomically with
         the terminal transitions: a cancel that wins in the window
@@ -349,90 +349,90 @@ role Job is export {
         the runner spawn must never be clobbered back to 'running'
         (nor produce a phantom job-started event). True iff the
         transition happened. )
-    method begin-running(--> Bool) {
-        $!terminal-lock.protect: {
-            return False if $!completion.status ~~ Kept;
-            $!state = 'running';
-            $!started-at = now;
-            True;
-        }
-    }
+	method begin-running(--> Bool) {
+		$!terminal-lock.protect: {
+			return False if $!completion.status ~~ Kept;
+			$!state = 'running';
+			$!started-at = now;
+			True;
+		}
+	}
 
     #|( Return the last dependency readiness report as detached
         top-level data. Empty means the job has not been coordinator-
         resolved yet. )
-    method dependency-state(--> Hash) {
-        $!dependency-state-lock.protect: {
-            my %copy;
-            %copy{.key} = .value for %!dependency-state.pairs;
-            %copy;
-        }
-    }
+	method dependency-state(--> Hash) {
+		$!dependency-state-lock.protect: {
+			my %copy;
+			%copy{.key} = .value for %!dependency-state.pairs;
+			%copy;
+		}
+	}
 
     #|( Replace the last dependency readiness report. The coordinator
         is the intended caller; validation keeps this observability
         field compact and scalar-only so it is safe for snapshots. )
-    method record-dependency-state(%report --> Nil) {
-        my %copy = self!validate-dependency-state(%report);
-        $!dependency-state-lock.protect: {
-            %!dependency-state = %copy;
-        }
-    }
+	method record-dependency-state(%report --> Nil) {
+		my %copy = self!validate-dependency-state(%report);
+		$!dependency-state-lock.protect: {
+			%!dependency-state = %copy;
+		}
+	}
 
-    method !validate-dependency-state(%report --> Hash) {
-        my $allowed = Set.new(<
+	method !validate-dependency-state(%report --> Hash) {
+		my $allowed = Set.new(<
             status prerequisite-id edge prerequisite-state required-state
         >);
-        for %report.keys -> $key {
-            die "JobQueue::Job: dependency-state.$key is not a supported key"
-                unless $allowed{$key};
-        }
+		for %report.keys -> $key {
+			die "JobQueue::Job: dependency-state.$key is not a supported key"
+				unless $allowed{$key};
+		}
 
-        my $status = %report<status>;
-        die "JobQueue::Job: dependency-state.status must be ready, blocked or doomed"
-            unless $status ~~ Str:D && $status ∈ <ready blocked doomed>;
+		my $status = %report<status>;
+		die "JobQueue::Job: dependency-state.status must be ready, blocked or doomed"
+			unless $status ~~ Str:D && $status ∈ <ready blocked doomed>;
 
-        my %out = status => $status;
-        if $status eq 'ready' {
-            die "JobQueue::Job: dependency-state.ready reports cannot carry prerequisite fields"
-                if %report.keys.elems > 1;
-            return %out;
-        }
+		my %out = status => $status;
+		if $status eq 'ready' {
+			die "JobQueue::Job: dependency-state.ready reports cannot carry prerequisite fields"
+				if %report.keys.elems > 1;
+			return %out;
+		}
 
-        for <prerequisite-id edge prerequisite-state required-state> -> $key {
-            die "JobQueue::Job: dependency-state.$key must be a string"
-                unless %report{$key} ~~ Str:D;
-        }
-        die "JobQueue::Job: dependency-state.edge must be depends-on or after"
-            unless %report<edge> ∈ <depends-on after>;
-        die "JobQueue::Job: dependency-state.required-state must be done or terminal"
-            unless %report<required-state> ∈ <done terminal>;
-        die "JobQueue::Job: dependency-state.required-state does not match edge"
-            unless %report<required-state> eq
-                (%report<edge> eq 'depends-on' ?? 'done' !! 'terminal');
-        die "JobQueue::Job: only hard dependencies can be doomed"
-            if $status eq 'doomed' && %report<edge> ne 'depends-on';
+		for <prerequisite-id edge prerequisite-state required-state> -> $key {
+			die "JobQueue::Job: dependency-state.$key must be a string"
+				unless %report{$key} ~~ Str:D;
+		}
+		die "JobQueue::Job: dependency-state.edge must be depends-on or after"
+			unless %report<edge> ∈ <depends-on after>;
+		die "JobQueue::Job: dependency-state.required-state must be done or terminal"
+			unless %report<required-state> ∈ <done terminal>;
+		die "JobQueue::Job: dependency-state.required-state does not match edge"
+			unless %report<required-state> eq
+				(%report<edge> eq 'depends-on' ?? 'done' !! 'terminal');
+		die "JobQueue::Job: only hard dependencies can be doomed"
+			if $status eq 'doomed' && %report<edge> ne 'depends-on';
 
-        %out<prerequisite-id> = %report<prerequisite-id>;
-        %out<edge> = %report<edge>;
-        %out<prerequisite-state> = %report<prerequisite-state>;
-        %out<required-state> = %report<required-state>;
-        %out;
-    }
+		%out<prerequisite-id> = %report<prerequisite-id>;
+		%out<edge> = %report<edge>;
+		%out<prerequisite-state> = %report<prerequisite-state>;
+		%out<required-state> = %report<required-state>;
+		%out;
+	}
 
     #|( Atomic state observation for scheduler diagnostics. The
         terminal lock makes the completion status/result and display
         state one coherent read, so a dependency report cannot pair a
         pre-finish status with a post-finish state. )
-    method dependency-observation(--> Hash) {
-        $!terminal-lock.protect: {
-            my Bool $terminal = $!completion.status ~~ Kept;
-            %(
-                terminal => $terminal,
-                state    => ($terminal ?? $!completion.result.Str !! $!state),
-            );
-        }
-    }
+	method dependency-observation(--> Hash) {
+		$!terminal-lock.protect: {
+			my Bool $terminal = $!completion.status ~~ Kept;
+			%(
+				terminal => $terminal,
+				state    => ($terminal ?? $!completion.result.Str !! $!state),
+			);
+		}
+	}
 
     #|( Subclass payload merged into the store-event snapshot built by
         C<JobQueue::Queue.job-snapshot>. Return whatever fields your
@@ -441,7 +441,7 @@ role Job is export {
         C<id>, C<state>, C<error> and friends.
 
         Override with this EXACT signature. Default: no extras. )
-    method snapshot-extras(--> Hash) { %() }
+	method snapshot-extras(--> Hash) { %() }
 
     #|( Subclass payload merged into C<dep-results{ this-job-id }> in
         every dependent, injected by C<JobQueue::Coordinator> at
@@ -449,5 +449,5 @@ role Job is export {
         its predecessor produced. C<state> and C<result> always win.
 
         Override with this EXACT signature. Default: no extras. )
-    method dep-extras(--> Hash) { %() }
+	method dep-extras(--> Hash) { %() }
 }

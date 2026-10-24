@@ -95,21 +95,21 @@ unit module JobQueue::Observability;
     that don't gate on C<enabled> still get a live object to
     C<finish>, rather than a Nil they'd have to guard. )
 class NullSpan is export {
-    method finish(*%args --> Nil) { }
+	method finish(*%args --> Nil) { }
 }
 
 #|( Silent tracer. C<enabled> is a constant False, so every
     C<enabled ?? start !! Nil> site in the queue short-circuits to Nil
     and no span object is ever allocated on the null path. )
 class NullTracer is export {
-    method enabled(--> False) { }
-    method start(Str:D $name, *%opts --> NullSpan) { NullSpan.new }
-    method instant(Str:D $name, *%opts --> Nil) { }
+	method enabled(--> False) { }
+	method start(Str:D $name, *%opts --> NullSpan) { NullSpan.new }
+	method instant(Str:D $name, *%opts --> Nil) { }
 }
 
 #| Silent log. Every verb is a no-op that discards its fields.
 class NullLog is export {
-    method debug(Str:D $verb, *%fields --> Nil) { }
-    method info(Str:D $verb, *%fields --> Nil) { }
-    method error(Str:D $verb, *%fields --> Nil) { }
+	method debug(Str:D $verb, *%fields --> Nil) { }
+	method info(Str:D $verb, *%fields --> Nil) { }
+	method error(Str:D $verb, *%fields --> Nil) { }
 }

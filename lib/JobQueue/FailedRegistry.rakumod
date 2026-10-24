@@ -87,8 +87,8 @@ has Str  @!order;       # insertion order, oldest first
 has Lock $!lock = Lock.new;
 
 submethod TWEAK() {
-    die "JobQueue::FailedRegistry: cap must be at least 1, got $!cap"
-        if $!cap < 1;
+	die "JobQueue::FailedRegistry: cap must be at least 1, got $!cap"
+		if $!cap < 1;
 }
 
 #|( Remember C<$job> for later retry. Idempotent: a job whose id is
@@ -100,28 +100,28 @@ submethod TWEAK() {
     a no-op returning False, so callers can pass an optional job
     straight through. )
 method remember($job --> Bool) {
-    return False without $job;
-    $!lock.protect: {
-        return False if %!jobs{$job.id}:exists;
-        %!jobs{$job.id} = $job;
-        @!order.push: $job.id;
-        while @!order.elems > $!cap {
-            %!jobs{@!order.shift}:delete;
-        }
-        True;
-    }
+	return False without $job;
+	$!lock.protect: {
+		return False if %!jobs{$job.id}:exists;
+		%!jobs{$job.id} = $job;
+		@!order.push: $job.id;
+		while @!order.elems > $!cap {
+			%!jobs{@!order.shift}:delete;
+		}
+		True;
+	}
 }
 
 #|( Remember a user-cancelled job, skipping system supersedes. See
     the "cancelled jobs are retryable" section above. Returns True
     iff the job was inserted. )
 method remember-cancelled($job --> Bool) {
-    return False without $job;
-    my Str $outcome = $job.completion.status ~~ Kept
-        ?? ($job.completion.result // '').Str
-        !! ($job.state // '');
-    return False if $outcome eq 'superseded';
-    self.remember($job);
+	return False without $job;
+	my Str $outcome = $job.completion.status ~~ Kept
+		?? ($job.completion.result // '').Str
+		!! ($job.state // '');
+	return False if $outcome eq 'superseded';
+	self.remember($job);
 }
 
 #|( Atomically remove and return the job registered under C<$job-id>,
@@ -129,29 +129,29 @@ method remember-cancelled($job --> Bool) {
     claimed). This is the retry gate: concurrent claims of the same
     id produce exactly one non-Nil result. )
 method claim(Str:D $job-id) {
-    $!lock.protect: {
-        my $job = %!jobs{$job-id};
-        with $job {
-            %!jobs{$job-id}:delete;
-            @!order = @!order.grep(* ne $job-id).Array;
-        }
-        $job // Nil;
-    }
+	$!lock.protect: {
+		my $job = %!jobs{$job-id};
+		with $job {
+			%!jobs{$job-id}:delete;
+			@!order = @!order.grep(* ne $job-id).Array;
+		}
+		$job // Nil;
+	}
 }
 
 #|( Non-destructive lookup — the job under C<$job-id>, or Nil.
     For rendering only: deciding to act on the result of a C<peek> is
     the race C<claim> exists to close. )
 method peek(Str:D $job-id) {
-    $!lock.protect: { %!jobs{$job-id} // Nil }
+	$!lock.protect: { %!jobs{$job-id} // Nil }
 }
 
 #| Remembered job ids, oldest first. Snapshot; safe to iterate.
 method ids(--> List) {
-    $!lock.protect: { @!order.List }
+	$!lock.protect: { @!order.List }
 }
 
 #| How many jobs are currently remembered.
 method elems(--> Int) {
-    $!lock.protect: { %!jobs.elems }
+	$!lock.protect: { %!jobs.elems }
 }
